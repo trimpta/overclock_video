@@ -1,7 +1,7 @@
 import json
 import os
 
-DEFAULT_LAST_RUN_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".last_run.json")
+DEFAULT_LAST_RUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data", ".last_run.json")
 
 
 def load_placement(path: str):
@@ -35,6 +35,7 @@ def load_last_run(path: str = DEFAULT_LAST_RUN_PATH):
 
 def save_last_run(data: dict, path: str = DEFAULT_LAST_RUN_PATH):
     try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception as e:

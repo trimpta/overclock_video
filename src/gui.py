@@ -21,7 +21,10 @@ from src.hand_tracking import HandTracker
 from src.smoothing import QuadTracker
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "hand_landmarker.task")
-TEMP_RECORDING = "temp_recording.mp4"
+USER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data")
+os.makedirs(USER_DATA_DIR, exist_ok=True)
+TEMP_RECORDING = os.path.join(USER_DATA_DIR, "temp_recording.mp4")
+RAW_TEMP_RECORDING = os.path.join(USER_DATA_DIR, "raw_temp.mp4")
 
 
 class PreviewLabel(QLabel):
@@ -348,7 +351,7 @@ class VideoProcessorThread(QThread):
                     if self._raw_writer is None:
                         try:
                             # Write raw full-res frames
-                            self._raw_writer = FfmpegFrameWriter("raw_temp.mp4", frame_w, frame_h, fps, codec="libx264", preset="ultrafast")
+                            self._raw_writer = FfmpegFrameWriter(RAW_TEMP_RECORDING, frame_w, frame_h, fps, codec="libx264", preset="ultrafast")
                         except Exception as e:
                             self.error_occurred.emit(f"Failed to start raw recording: {e}")
                             self._recording = False
@@ -538,7 +541,7 @@ class VideoProcessorThread(QThread):
         if self._render_params_snapshot is None:
             return
             
-        raw_path = "raw_temp.mp4"
+        raw_path = RAW_TEMP_RECORDING
         if not os.path.isfile(raw_path):
             self.error_occurred.emit("Raw recording file missing.")
             return
