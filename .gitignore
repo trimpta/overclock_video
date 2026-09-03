@@ -6,3 +6,7 @@ __pycache__/
 *_placement.json
 .last_run.json
 src/user_data/
+/image.png
+/input.mp4
+/*.flac
+/media/
