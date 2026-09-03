@@ -12,7 +12,7 @@ from PyQt6.QtGui import QImage, QPixmap, QPalette, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QPushButton, QFileDialog, QSlider, QCheckBox, 
-    QGroupBox, QFormLayout, QComboBox, QMessageBox, QStyle, QProgressBar
+    QGroupBox, QFormLayout, QComboBox, QMessageBox, QStyle, QProgressBar, QLineEdit
 )
 
 from src.audio_mux import FfmpegFrameWriter
@@ -510,6 +510,10 @@ class VideoProcessorThread(QThread):
                             self._last_placement = self.placement.copy()
                         out_frame = composite_frame(prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=self.feather)
                         
+                    if getattr(self, "_render_debug", False):
+                        from src.debug_draw import draw_debug_overlay
+                        out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
+                        
                     writer.write(out_frame)
                     
                     # Signal progress
@@ -606,6 +610,10 @@ class VideoProcessorThread(QThread):
                             local_cached_canvas_bgr, local_cached_canvas_alpha = build_canvas(active_image_bgra, local_placement, frame_w, frame_h)
                             local_last_placement = local_placement.copy()
                         out_frame = composite_frame(prev_frame, active_quad_pts, local_cached_canvas_bgr, local_cached_canvas_alpha, feather=local_feather)
+                        
+                    if getattr(self, "_render_debug", False):
+                        from src.debug_draw import draw_debug_overlay
+                        out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
                         
                     writer.write(out_frame)
                     
@@ -850,14 +858,33 @@ class MainWindow(QMainWindow):
         self.progress_bar.hide()
         bottom_layout.addWidget(self.progress_bar)
         
+        # Export Options
+        self.export_options_group = QGroupBox("Export Options")
+        export_opt_layout = QVBoxLayout(self.export_options_group)
+        
+        dir_layout = QHBoxLayout()
+        default_out_dir = os.path.join(os.getcwd(), "output")
+        self.le_out_dir = QLineEdit(default_out_dir)
+        self.btn_out_dir = QPushButton("Browse...")
+        self.btn_out_dir.clicked.connect(self.select_out_dir)
+        dir_layout.addWidget(QLabel("Output Dir:"))
+        dir_layout.addWidget(self.le_out_dir)
+        dir_layout.addWidget(self.btn_out_dir)
+        export_opt_layout.addLayout(dir_layout)
+        
+        self.cb_render_debug = QCheckBox("Render Debug Overlays")
+        self.cb_render_debug.setToolTip("Renders the skeletal tracking and quad corners into the final exported video.")
+        export_opt_layout.addWidget(self.cb_render_debug)
+        
         # Unified Export button
         self.btn_export = QPushButton("Export")
         self.btn_export.setStyleSheet("background-color: #0078D7; color: white; font-weight: bold;")
         self.btn_export.clicked.connect(self.do_export)
         self.btn_export.setEnabled(False) # Enabled when video loaded, or webcam recording finished
-        bottom_layout.addWidget(self.btn_export)
+        export_opt_layout.addWidget(self.btn_export)
         
         right_panel.addWidget(self.bottom_controls)
+        right_panel.addWidget(self.export_options_group)
 
         main_layout.addLayout(left_panel, 1)
         main_layout.addLayout(right_panel, 3)
@@ -1006,9 +1033,29 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(True)
         self.progress_bar.hide()
 
+    def select_out_dir(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Output Directory", self.le_out_dir.text())
+        if dir_path:
+            self.le_out_dir.setText(dir_path)
+
     def do_export(self):
-        out_path, _ = QFileDialog.getSaveFileName(self, "Save Video As", "output.mp4", "Video Files (*.mp4)")
-        if not out_path: return
+        out_dir = self.le_out_dir.text()
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Directory Error", f"Could not create output directory:\n{e}")
+            return
+            
+        base_name = "output"
+        ext = ".mp4"
+        out_path = os.path.join(out_dir, f"{base_name}{ext}")
+        
+        idx = 1
+        while os.path.exists(out_path):
+            out_path = os.path.join(out_dir, f"{base_name}_{idx:03d}{ext}")
+            idx += 1
+            
+        self.processor._render_debug = self.cb_render_debug.isChecked()
         
         if self._is_webcam:
             # We already recorded to TEMP_RECORDING, just copy it
