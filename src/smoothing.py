@@ -38,6 +38,7 @@ class PointSmoother:
 
             self.missed_frames += 1
             if self.missed_frames > self.coast_limit:
+                self._initialized = False
                 return None, None, False, True
 
             pred = self._kf.predict()
