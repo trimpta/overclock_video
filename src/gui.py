@@ -1,6 +1,7 @@
 import os
 import shutil
 import sys
+import threading
 import time
 import traceback
 import cv2
@@ -10,17 +11,19 @@ import concurrent.futures
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QImage, QPixmap, QPalette, QColor
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QLabel, QPushButton, QFileDialog, QSlider, QCheckBox, 
-    QGroupBox, QFormLayout, QComboBox, QMessageBox, QStyle, QProgressBar, QLineEdit
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QFileDialog, QSlider, QCheckBox,
+    QGroupBox, QFormLayout, QComboBox, QMessageBox, QStyle, QProgressBar, QLineEdit, QDialog,
 )
 
 from src.audio_mux import FfmpegFrameWriter
+from src.config import load_last_run, save_last_run
 from src.compositor import build_canvas, composite_frame, warp_composite_frame, load_image_bgra, make_greenscreen_bgra, make_grid_bgra, full_frame_placement
 from src.hand_tracking import HandTracker
 from src.smoothing import QuadTracker
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "hand_landmarker.task")
+PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 USER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data")
 os.makedirs(USER_DATA_DIR, exist_ok=True)
 TEMP_RECORDING = os.path.join(USER_DATA_DIR, "temp_recording.mp4")
@@ -101,6 +104,7 @@ class VideoProcessorThread(QThread):
     error_occurred = pyqtSignal(str)
     duration_changed = pyqtSignal(int) # total frames
     position_changed = pyqtSignal(int) # current frame
+    resolution_changed = pyqtSignal(int, int)
     recording_finished = pyqtSignal()
     raw_recording_ready = pyqtSignal()
     export_finished = pyqtSignal()
@@ -109,6 +113,7 @@ class VideoProcessorThread(QThread):
 
     def __init__(self):
         super().__init__()
+        self._lock = threading.Lock()
         self.video_path = None
         self.image_path = None
         self.music_path = None
@@ -131,6 +136,7 @@ class VideoProcessorThread(QThread):
         self._scanning_endfade = False
         self.endfade_trigger_frame = None
         self.endfade_base_quad = None
+        self.endfade_base_quad_proxy = None
         self.endfade_duration_frames = 60
         self.endfade_offset = 0
 
@@ -149,23 +155,39 @@ class VideoProcessorThread(QThread):
         self._cached_canvas_bgr = None
         self._cached_canvas_alpha = None
         self._last_placement = None
+        self._cached_canvas_size = None
         self._executor = None
         self._current_qimage_ref = None
+        self._gui_frame_pending = False
         
         self.proxy_scale = 0.5
         self._raw_writer = None
         self._render_params_snapshot = None
         self._rendering_webcam = False
 
+    def _set_flag(self, name, value):
+        with self._lock:
+            setattr(self, name, value)
+
+    def _get_flag(self, name):
+        with self._lock:
+            return getattr(self, name)
+
+    def ack_frame(self):
+        self._gui_frame_pending = False
+
+    def request_webcam_render(self):
+        self._set_flag('_rendering_webcam', True)
+
     def start_recording(self):
-        self._recording = True
+        self._set_flag('_recording', True)
 
     def stop_recording(self):
-        self._recording = False
+        self._set_flag('_recording', False)
         
     def start_export(self, export_path):
         self.export_path = export_path
-        self._exporting = True
+        self._set_flag('_exporting', True)
 
     def update_params(self, params):
         if "warp_mode" in params: self.warp_mode = params["warp_mode"]
@@ -178,7 +200,7 @@ class VideoProcessorThread(QThread):
         if "endfade_mode" in params:
             new_mode = params["endfade_mode"]
             if new_mode and not self.endfade_mode and not self.is_webcam:
-                self._scanning_endfade = True
+                self._set_flag('_scanning_endfade', True)
             self.endfade_mode = new_mode
         if "endfade_offset" in params: self.endfade_offset = params["endfade_offset"]
         if "endfade_duration" in params: self.endfade_duration_frames = params["endfade_duration"]
@@ -194,19 +216,85 @@ class VideoProcessorThread(QThread):
         self._cached_canvas_bgr = None
         self._cached_canvas_alpha = None
         self._last_placement = None
-        if self._running:
+        self._cached_canvas_size = None
+        if self._get_flag('_running'):
             self.stop()
             self.start()
 
     def request_seek(self, frame_idx):
-        self._seek_request = frame_idx
+        self._set_flag('_seek_request', frame_idx)
         
     def set_paused(self, paused):
-        self._paused = paused
+        self._set_flag('_paused', paused)
+
+    def _clear_canvas_cache(self):
+        self._cached_canvas_bgr = None
+        self._cached_canvas_alpha = None
+        self._last_placement = None
+        self._cached_canvas_size = None
+
+    def _ensure_canvas(self, active_image_bgra, placement, cache_w, cache_h, proxy_scale=1.0):
+        cache_key_size = (cache_w, cache_h)
+        if not getattr(self, "has_custom_image", True) and not self.warp_mode:
+            if self._cached_canvas_bgr is None or self._cached_canvas_size != cache_key_size:
+                self._cached_canvas_bgr = active_image_bgra[:, :, :3].copy()
+                self._cached_canvas_alpha = active_image_bgra[:, :, 3].copy()
+                self._cached_canvas_size = cache_key_size
+            return
+        if self._last_placement != placement or self._cached_canvas_bgr is None or self._cached_canvas_size != cache_key_size:
+            canvas_placement = placement.copy()
+            if proxy_scale != 1.0:
+                canvas_placement["x"] = canvas_placement["x"] * proxy_scale
+                canvas_placement["y"] = canvas_placement["y"] * proxy_scale
+            self._cached_canvas_bgr, self._cached_canvas_alpha = build_canvas(active_image_bgra, canvas_placement, cache_w, cache_h)
+            self._last_placement = placement.copy()
+            self._cached_canvas_size = cache_key_size
+
+    def _compute_endfade_quad(self, prev_frame_idx, quad_pts, frame_w, frame_h, proxy_w, proxy_h, use_proxy=False,
+                               endfade_base_quad=None, endfade_base_quad_proxy=None):
+        if not self.endfade_mode or self.endfade_trigger_frame is None or self.is_webcam:
+            return quad_pts
+        trigger = self.endfade_trigger_frame + self.endfade_offset
+        if prev_frame_idx < trigger:
+            return quad_pts
+        progress = min(1.0, (prev_frame_idx - trigger) / max(1, self.endfade_duration_frames))
+        progress = progress * progress * (3 - 2 * progress)
+        if use_proxy:
+            start_quad = endfade_base_quad_proxy if endfade_base_quad_proxy is not None else (quad_pts if quad_pts is not None else np.zeros((4, 2)))
+            target_quad = np.array([[0, 0], [proxy_w, 0], [proxy_w, proxy_h], [0, proxy_h]], dtype=np.float32)
+        else:
+            start_quad = endfade_base_quad if endfade_base_quad is not None else (quad_pts if quad_pts is not None else np.zeros((4, 2)))
+            target_quad = np.array([[0, 0], [frame_w, 0], [frame_w, frame_h], [0, frame_h]], dtype=np.float32)
+        active_quad_pts = (start_quad * (1.0 - progress) + target_quad * progress).astype(np.int32)
+        if active_quad_pts is not None and quad_pts is None:
+            return active_quad_pts
+        return active_quad_pts
+
+    def _emit_gui_frame(self, out_frame, fps):
+        ow, oh = out_frame.shape[1], out_frame.shape[0]
+        gw, gh = self.target_gui_size
+        if gw > 0 and gh > 0:
+            scale = min(gw / ow, gh / oh)
+            dw, dh = max(1, int(ow * scale)), max(1, int(oh * scale))
+            gui_frame = cv2.resize(out_frame, (dw, dh), interpolation=cv2.INTER_LINEAR)
+        else:
+            gui_frame = out_frame
+        gui_frame = cv2.cvtColor(gui_frame, cv2.COLOR_BGR2RGB)
+        if self.is_webcam:
+            dbg = "ON" if self.show_debug else "OFF"
+            cv2.putText(gui_frame, f"LIVE (WEBCAM) | Debug: {dbg}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 2, cv2.LINE_AA)
+        if not self._gui_frame_pending:
+            h, w, ch = gui_frame.shape
+            bytes_per_line = ch * w
+            self._current_qimage_ref = gui_frame
+            qimg = QImage(gui_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
+            self._gui_frame_pending = True
+            self.frame_ready.emit(qimg)
+        time.sleep(1.0 / fps)
 
     def run(self):
         if self.video_path is None: return
-        self._running = True
+        self._set_flag('_running', True)
         
         if self.is_webcam:
             self.cap = cv2.VideoCapture(int(self.video_path) if str(self.video_path).isdigit() else 0)
@@ -224,6 +312,10 @@ class VideoProcessorThread(QThread):
         frame_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = None if self.is_webcam else int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        longest = max(frame_w, frame_h)
+        self.proxy_scale = min(0.5, max(0.25, 640.0 / longest))
+        self.resolution_changed.emit(frame_w, frame_h)
         
         if not self.is_webcam and total_frames:
             self.duration_changed.emit(total_frames)
@@ -231,20 +323,22 @@ class VideoProcessorThread(QThread):
         proxy_w = int(frame_w * self.proxy_scale)
         proxy_h = int(frame_h * self.proxy_scale)
 
+        self.full_grid_bgra = make_grid_bgra(frame_w, frame_h)
+        self.grid_bgra = make_grid_bgra(proxy_w, proxy_h)
+
         if self.image_path and os.path.isfile(self.image_path):
             self.full_image_bgra = load_image_bgra(self.image_path)
-            self.image_bgra = cv2.resize(self.full_image_bgra, (proxy_w, proxy_h), interpolation=cv2.INTER_AREA)
+            self.image_bgra = cv2.resize(self.full_image_bgra, (0, 0), fx=self.proxy_scale, fy=self.proxy_scale, interpolation=cv2.INTER_AREA)
             self.has_custom_image = True
         else:
             self.full_image_bgra = make_greenscreen_bgra(frame_w, frame_h)
-            self.full_grid_bgra = make_grid_bgra(frame_w, frame_h)
             self.image_bgra = make_greenscreen_bgra(proxy_w, proxy_h)
-            self.grid_bgra = make_grid_bgra(proxy_w, proxy_h)
             self.has_custom_image = False
 
         self.tracker = HandTracker(MODEL_PATH, num_hands=2)
         self.quad_tracker = QuadTracker(coast_limit=self.coast_limit)
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._gui_frame_pending = False
         
         start_time = time.time()
         
@@ -254,40 +348,44 @@ class VideoProcessorThread(QThread):
         prev_frame_idx = 0
         
         try:
-            while self._running:
-                # Handle Export for Video Mode
-                if self._exporting and not self.is_webcam:
-                    self._run_export_loop(frame_w, frame_h, fps)
-                    self._exporting = False
-                    self.export_finished.emit()
+            while self._get_flag('_running'):
+                if self._get_flag('_exporting') and not self.is_webcam:
+                    try:
+                        self._run_export_loop(frame_w, frame_h, fps)
+                        self.export_finished.emit()
+                    except Exception as e:
+                        self.error_occurred.emit(str(e))
+                    finally:
+                        self._set_flag('_exporting', False)
+                        self._clear_canvas_cache()
                     continue
                     
-                # Handle Offline Rendering for Webcam Mode
-                if self._rendering_webcam and self.is_webcam:
+                if self._get_flag('_rendering_webcam') and self.is_webcam:
                     self._run_webcam_render_loop(frame_w, frame_h, fps)
-                    self._rendering_webcam = False
+                    self._set_flag('_rendering_webcam', False)
                     self.recording_finished.emit()
                     continue
                 
-                # Handle Seek
-                if self._seek_request is not None and not self.is_webcam:
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, self._seek_request)
-                    self._seek_request = None
+                seek_req = self._get_flag('_seek_request')
+                if seek_req is not None and not self.is_webcam:
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, seek_req)
+                    self._set_flag('_seek_request', None)
                     future_tracker = None
                     prev_frame = None
+                    proxy_prev_frame = None
+                    self.quad_tracker.reset()
+                    self.tracker.reset()
                     
-                # Handle Pause
-                if self._paused and not self.is_webcam:
+                if self._get_flag('_paused') and not self.is_webcam:
                     time.sleep(0.05)
                     continue
 
-                # Handle Endfade Pre-Pass
-                if self._scanning_endfade and not self.is_webcam:
+                if self._get_flag('_scanning_endfade') and not self.is_webcam:
                     last_valid_frame = -1
                     last_quad = None
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     frame_idx = 0
-                    while self._running and self._scanning_endfade:
+                    while self._get_flag('_running') and self._get_flag('_scanning_endfade'):
                         ok, f = self.cap.read()
                         if not ok: break
                         proxy_f = cv2.resize(f, (proxy_w, proxy_h), interpolation=cv2.INTER_LINEAR)
@@ -303,9 +401,10 @@ class VideoProcessorThread(QThread):
                         if frame_idx % 10 == 0:
                             self.endfade_scan_progress.emit(frame_idx, total_frames)
                             
-                    self._scanning_endfade = False
+                    self._set_flag('_scanning_endfade', False)
                     if last_valid_frame != -1 and last_quad is not None:
                         self.endfade_trigger_frame = last_valid_frame
+                        self.endfade_base_quad_proxy = last_quad.copy()
                         scale_x = frame_w / proxy_w
                         scale_y = frame_h / proxy_h
                         self.endfade_base_quad = (last_quad * [scale_x, scale_y]).astype(np.int32)
@@ -314,7 +413,6 @@ class VideoProcessorThread(QThread):
                         self.endfade_mode = False
                         self.error_occurred.emit("Endfade Scan failed: No hands detected in the video.")
                         
-                    # Reset playhead to loop region
                     if last_valid_frame != -1:
                         self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, last_valid_frame - int(fps)))
                     else:
@@ -327,7 +425,6 @@ class VideoProcessorThread(QThread):
                         time.sleep(0.01)
                         continue
                     else:
-                        # Auto-loop video. If endfade mode, loop only the end region
                         if self.endfade_mode and self.endfade_trigger_frame is not None:
                             loop_start = max(0, self.endfade_trigger_frame + self.endfade_offset - int(fps))
                             self.cap.set(cv2.CAP_PROP_POS_FRAMES, loop_start)
@@ -335,49 +432,64 @@ class VideoProcessorThread(QThread):
                             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         future_tracker = None
                         prev_frame = None
+                        proxy_prev_frame = None
+                        self.quad_tracker.reset()
+                        self.tracker.reset()
                         continue
                 
                 if self.is_webcam:
                     frame = cv2.flip(frame, 1)
                 
-                # Create proxy frame
                 proxy_frame = cv2.resize(frame, (proxy_w, proxy_h), interpolation=cv2.INTER_LINEAR)
                 
                 current_frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) if not self.is_webcam else 0
                 timestamp_ms = int((time.time() - start_time) * 1000)
                 
-                # Handle Raw Recording for Webcam Mode
-                if self._recording and self.is_webcam:
+                if self._get_flag('_recording') and self.is_webcam:
                     if self._raw_writer is None:
                         try:
-                            # Write raw full-res frames
                             self._raw_writer = FfmpegFrameWriter(RAW_TEMP_RECORDING, frame_w, frame_h, fps, codec="libx264", preset="ultrafast")
                         except Exception as e:
                             self.error_occurred.emit(f"Failed to start raw recording: {e}")
-                            self._recording = False
+                            self._set_flag('_recording', False)
                     
                     if self._raw_writer:
-                        self._raw_writer.write(frame)
+                        if not self._raw_writer.write(frame) or self._raw_writer.failed:
+                            self.error_occurred.emit(self._raw_writer.error_message or "Raw recording write failed.")
+                            self._set_flag('_recording', False)
+                            try:
+                                self._raw_writer.terminate()
+                            except Exception:
+                                pass
+                            self._raw_writer = None
                 else:
                     if self._raw_writer is not None:
-                        self._raw_writer.close()
+                        try:
+                            self._raw_writer.close()
+                        except Exception as e:
+                            self.error_occurred.emit(f"Failed to finalize recording: {e}")
+                            self._raw_writer = None
+                            continue
                         self._raw_writer = None
+                        if not os.path.isfile(RAW_TEMP_RECORDING) or os.path.getsize(RAW_TEMP_RECORDING) == 0:
+                            self.error_occurred.emit("Recording file missing or empty after stop.")
+                            continue
                         self._render_params_snapshot = {
                             "warp_mode": self.warp_mode,
                             "placement": self.placement.copy(),
                             "feather": self.feather,
+                            "coast_limit": self.coast_limit,
                             "endfade_mode": self.endfade_mode,
                             "endfade_offset": self.endfade_offset,
                             "endfade_duration_frames": self.endfade_duration_frames,
                             "endfade_base_quad": self.endfade_base_quad.copy() if self.endfade_base_quad is not None else None,
+                            "endfade_base_quad_proxy": self.endfade_base_quad_proxy.copy() if self.endfade_base_quad_proxy is not None else None,
                             "endfade_trigger_frame": self.endfade_trigger_frame,
                         }
                         self.raw_recording_ready.emit()
                 
-                # Submit tracking to background executor
                 current_future = self._executor.submit(self.tracker.process, proxy_frame, timestamp_ms)
 
-                # Process the previous frame whose tracking is now complete
                 if prev_frame is not None and future_tracker is not None:
                     if not self.is_webcam:
                         self.position_changed.emit(prev_frame_idx)
@@ -388,63 +500,27 @@ class VideoProcessorThread(QThread):
                     smoothed = self.quad_tracker.update(hand_result.roles)
                     quad_pts = QuadTracker.quad_points(smoothed)
 
-                    active_quad_pts = quad_pts
-                    if self.endfade_mode and self.endfade_trigger_frame is not None and not self.is_webcam:
-                        trigger = self.endfade_trigger_frame + self.endfade_offset
-                        if prev_frame_idx >= trigger:
-                            progress = min(1.0, (prev_frame_idx - trigger) / max(1, self.endfade_duration_frames))
-                            progress = progress * progress * (3 - 2 * progress) # ease-in-out
-                            
-                            start_quad = self.endfade_base_quad if self.endfade_base_quad is not None else (quad_pts if quad_pts is not None else np.zeros((4,2)))
-                            target_quad = np.array([
-                                [0, 0], [proxy_w, 0], [proxy_w, proxy_h], [0, proxy_h]
-                            ], dtype=np.float32)
-                            
-                            active_quad_pts = (start_quad * (1.0 - progress) + target_quad * progress).astype(np.int32)
-                            
-                            # In endfade, we override missing quad_pts so it still renders
-                            if active_quad_pts is not None and quad_pts is None:
-                                quad_pts = active_quad_pts
+                    active_quad_pts = self._compute_endfade_quad(
+                        prev_frame_idx, quad_pts, frame_w, frame_h, proxy_w, proxy_h,
+                        use_proxy=True, endfade_base_quad_proxy=self.endfade_base_quad_proxy,
+                    )
 
                     active_image_bgra = self.image_bgra
                     if not getattr(self, "has_custom_image", True) and self.warp_mode:
-                        active_image_bgra = getattr(self, "grid_bgra", self.image_bgra)
+                        active_image_bgra = self.grid_bgra
 
                     if self.warp_mode:
                         out_frame = warp_composite_frame(proxy_prev_frame, active_quad_pts, active_image_bgra, feather=self.feather)
                     else:
-                        if self._last_placement != self.placement or self._cached_canvas_bgr is None:
-                            proxy_placement = self.placement.copy()
-                            proxy_placement["x"] = proxy_placement["x"] * self.proxy_scale
-                            proxy_placement["y"] = proxy_placement["y"] * self.proxy_scale
-                            self._cached_canvas_bgr, self._cached_canvas_alpha = build_canvas(active_image_bgra, proxy_placement, proxy_w, proxy_h)
-                            self._last_placement = self.placement.copy()
+                        self._ensure_canvas(active_image_bgra, self.placement, proxy_w, proxy_h, proxy_scale=self.proxy_scale)
                         out_frame = composite_frame(proxy_prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=self.feather)
 
                     if self.show_debug:
                         from src.debug_draw import draw_debug_overlay
                         out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
 
-                    # Fast resize for GUI on background thread
-                    gw, gh = self.target_gui_size
-                    if gw > 0 and gh > 0:
-                        gui_frame = cv2.resize(out_frame, (gw, gh), interpolation=cv2.INTER_LINEAR)
-                    else:
-                        gui_frame = out_frame
+                    self._emit_gui_frame(out_frame, fps)
 
-                    # In-place color conversion and zero-copy QImage
-                    cv2.cvtColor(gui_frame, cv2.COLOR_BGR2RGB, dst=gui_frame)
-                    h, w, ch = gui_frame.shape
-                    bytes_per_line = ch * w
-                    self._current_qimage_ref = gui_frame # Retain reference to prevent garbage collection
-                    qimg = QImage(gui_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
-                    self.frame_ready.emit(qimg)
-
-                    if not self.is_webcam:
-                        # Very simple fps sync
-                        time.sleep(1.0 / fps)
-
-                # Advance pipeline
                 prev_frame = frame
                 proxy_prev_frame = proxy_frame
                 future_tracker = current_future
@@ -456,8 +532,17 @@ class VideoProcessorThread(QThread):
         finally:
             if self._executor:
                 self._executor.shutdown(wait=True)
+            if getattr(self, '_raw_writer', None):
+                try:
+                    self._raw_writer.terminate()
+                except Exception:
+                    pass
+                self._raw_writer = None
             if getattr(self, 'writer', None):
-                self.writer.close()
+                try:
+                    self.writer.terminate()
+                except Exception:
+                    pass
                 self.writer = None
             if self.cap:
                 self.cap.release()
@@ -466,6 +551,9 @@ class VideoProcessorThread(QThread):
 
     def _run_export_loop(self, frame_w, frame_h, fps):
         """Fast headless render loop for exporting a video file"""
+        self._clear_canvas_cache()
+        self.tracker.reset()
+        self.quad_tracker.reset()
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         writer = FfmpegFrameWriter(self.export_path, frame_w, frame_h, fps, self.music_path, codec=self.codec, preset=self.preset)
         
@@ -473,58 +561,53 @@ class VideoProcessorThread(QThread):
         prev_frame = None
         prev_frame_idx = 0
         current_frame_idx = 0
+
+        def process_prev():
+            nonlocal prev_frame_idx
+            hand_result = future_tracker.result()
+            self.quad_tracker.coast_limit = self.coast_limit
+            smoothed = self.quad_tracker.update(hand_result.roles)
+            quad_pts = QuadTracker.quad_points(smoothed)
+
+            active_quad_pts = self._compute_endfade_quad(
+                prev_frame_idx, quad_pts, frame_w, frame_h, frame_w, frame_h,
+                use_proxy=False, endfade_base_quad=self.endfade_base_quad,
+            )
+
+            active_image_bgra = self.full_image_bgra
+            if not getattr(self, "has_custom_image", True) and self.warp_mode:
+                active_image_bgra = self.full_grid_bgra
+
+            if self.warp_mode:
+                out_frame = warp_composite_frame(prev_frame, active_quad_pts, active_image_bgra, feather=self.feather)
+            else:
+                self._ensure_canvas(active_image_bgra, self.placement, frame_w, frame_h)
+                out_frame = composite_frame(prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=self.feather)
+                
+            if getattr(self, "_render_debug", False):
+                from src.debug_draw import draw_debug_overlay
+                out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
+                
+            if not writer.write(out_frame) or writer.failed:
+                raise RuntimeError(writer.error_message or "Export write failed.")
+            
+            if prev_frame_idx % 10 == 0:
+                self.position_changed.emit(prev_frame_idx)
         
         try:
-            while self._exporting and self._running:
+            while self._get_flag('_exporting') and self._get_flag('_running'):
                 ok, frame = self.cap.read()
                 
-                # Submit current frame if available
                 if ok:
                     timestamp_ms = int((current_frame_idx / fps) * 1000)
                     current_future = self._executor.submit(self.tracker.process, frame, timestamp_ms)
                 else:
                     current_future = None
                     
-                # Process previous frame
                 if prev_frame is not None and future_tracker is not None:
-                    hand_result = future_tracker.result()
-                    smoothed = self.quad_tracker.update(hand_result.roles)
-                    quad_pts = QuadTracker.quad_points(smoothed)
-
-                    active_quad_pts = quad_pts
-                    if self.endfade_mode and self.endfade_trigger_frame is not None and not self.is_webcam:
-                        trigger = self.endfade_trigger_frame + self.endfade_offset
-                        if prev_frame_idx >= trigger:
-                            progress = min(1.0, (prev_frame_idx - trigger) / max(1, self.endfade_duration_frames))
-                            progress = progress * progress * (3 - 2 * progress)
-                            start_quad = self.endfade_base_quad if self.endfade_base_quad is not None else (quad_pts if quad_pts is not None else np.zeros((4,2)))
-                            target_quad = np.array([[0,0], [frame_w,0], [frame_w,frame_h], [0,frame_h]], dtype=np.float32)
-                            active_quad_pts = (start_quad * (1.0 - progress) + target_quad * progress).astype(np.int32)
-
-                    active_image_bgra = self.full_image_bgra
-                    if not getattr(self, "has_custom_image", True) and self.warp_mode:
-                        active_image_bgra = getattr(self, "full_grid_bgra", self.full_image_bgra)
-
-                    if self.warp_mode:
-                        out_frame = warp_composite_frame(prev_frame, active_quad_pts, active_image_bgra, feather=self.feather)
-                    else:
-                        if self._last_placement != self.placement or self._cached_canvas_bgr is None:
-                            self._cached_canvas_bgr, self._cached_canvas_alpha = build_canvas(active_image_bgra, self.placement, frame_w, frame_h)
-                            self._last_placement = self.placement.copy()
-                        out_frame = composite_frame(prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=self.feather)
-                        
-                    if getattr(self, "_render_debug", False):
-                        from src.debug_draw import draw_debug_overlay
-                        out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
-                        
-                    writer.write(out_frame)
-                    
-                    # Signal progress
-                    if prev_frame_idx % 10 == 0:
-                        self.position_changed.emit(prev_frame_idx)
+                    process_prev()
                 
                 if not ok and prev_frame is None:
-                    # Finished processing all frames
                     break
                     
                 prev_frame = frame if ok else None
@@ -532,9 +615,16 @@ class VideoProcessorThread(QThread):
                 prev_frame_idx = current_frame_idx
                 if ok:
                     current_frame_idx += 1
+
+            if prev_frame is not None and future_tracker is not None:
+                process_prev()
                     
         finally:
-            writer.close()
+            try:
+                writer.close()
+            except Exception as e:
+                raise RuntimeError(f"Failed to finalize export: {e}") from e
+            self._clear_canvas_cache()
 
     def _run_webcam_render_loop(self, frame_w, frame_h, fps):
         """Offline full-res render loop for webcam recordings"""
@@ -551,6 +641,9 @@ class VideoProcessorThread(QThread):
             self.error_occurred.emit("Could not read raw recording.")
             return
 
+        self.tracker.reset()
+        self.quad_tracker.reset()
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames > 0:
             self.duration_changed.emit(total_frames)
@@ -566,6 +659,7 @@ class VideoProcessorThread(QThread):
         local_warp_mode = params.get("warp_mode", False)
         local_placement = params.get("placement", {"x": 960, "y": 540, "scale": 1.0, "rotation_deg": 0.0})
         local_feather = params.get("feather", 9)
+        local_coast_limit = params.get("coast_limit", 0)
         local_endfade_mode = params.get("endfade_mode", False)
         local_endfade_trigger_frame = params.get("endfade_trigger_frame", None)
         local_endfade_offset = params.get("endfade_offset", 0)
@@ -575,9 +669,68 @@ class VideoProcessorThread(QThread):
         local_cached_canvas_bgr = None
         local_cached_canvas_alpha = None
         local_last_placement = None
+        local_cached_canvas_size = None
+
+        def ensure_local_canvas(active_image_bgra):
+            nonlocal local_cached_canvas_bgr, local_cached_canvas_alpha, local_last_placement, local_cached_canvas_size
+            cache_key_size = (frame_w, frame_h)
+            if not getattr(self, "has_custom_image", True) and not local_warp_mode:
+                if local_cached_canvas_bgr is None or local_cached_canvas_size != cache_key_size:
+                    local_cached_canvas_bgr = active_image_bgra[:, :, :3].copy()
+                    local_cached_canvas_alpha = active_image_bgra[:, :, 3].copy()
+                    local_cached_canvas_size = cache_key_size
+                return
+            if local_last_placement != local_placement or local_cached_canvas_bgr is None or local_cached_canvas_size != cache_key_size:
+                local_cached_canvas_bgr, local_cached_canvas_alpha = build_canvas(active_image_bgra, local_placement, frame_w, frame_h)
+                local_last_placement = local_placement.copy()
+                local_cached_canvas_size = cache_key_size
+
+        def compute_local_endfade(prev_idx, quad_pts):
+            if not local_endfade_mode or local_endfade_trigger_frame is None:
+                return quad_pts
+            trigger = local_endfade_trigger_frame + local_endfade_offset
+            if prev_idx < trigger:
+                return quad_pts
+            progress = min(1.0, (prev_idx - trigger) / max(1, local_endfade_duration_frames))
+            progress = progress * progress * (3 - 2 * progress)
+            start_quad = local_endfade_base_quad if local_endfade_base_quad is not None else (quad_pts if quad_pts is not None else np.zeros((4, 2)))
+            target_quad = np.array([[0, 0], [frame_w, 0], [frame_w, frame_h], [0, frame_h]], dtype=np.float32)
+            active_quad_pts = (start_quad * (1.0 - progress) + target_quad * progress).astype(np.int32)
+            if active_quad_pts is not None and quad_pts is None:
+                return active_quad_pts
+            return active_quad_pts
+
+        def process_prev():
+            nonlocal prev_frame_idx
+            hand_result = future_tracker.result()
+            self.quad_tracker.coast_limit = local_coast_limit
+            smoothed = self.quad_tracker.update(hand_result.roles)
+            quad_pts = QuadTracker.quad_points(smoothed)
+
+            active_quad_pts = compute_local_endfade(prev_frame_idx, quad_pts)
+
+            active_image_bgra = self.full_image_bgra
+            if not getattr(self, "has_custom_image", True) and local_warp_mode:
+                active_image_bgra = self.full_grid_bgra
+
+            if local_warp_mode:
+                out_frame = warp_composite_frame(prev_frame, active_quad_pts, active_image_bgra, feather=local_feather)
+            else:
+                ensure_local_canvas(active_image_bgra)
+                out_frame = composite_frame(prev_frame, active_quad_pts, local_cached_canvas_bgr, local_cached_canvas_alpha, feather=local_feather)
+                        
+            if getattr(self, "_render_debug", False):
+                from src.debug_draw import draw_debug_overlay
+                out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
+                        
+            if not writer.write(out_frame) or writer.failed:
+                raise RuntimeError(writer.error_message or "Webcam render write failed.")
+            
+            if prev_frame_idx % 10 == 0:
+                self.position_changed.emit(prev_frame_idx)
         
         try:
-            while self._running:
+            while self._get_flag('_running'):
                 ok, frame = cap.read()
                 
                 if ok:
@@ -587,41 +740,7 @@ class VideoProcessorThread(QThread):
                     current_future = None
                     
                 if prev_frame is not None and future_tracker is not None:
-                    hand_result = future_tracker.result()
-                    self.quad_tracker.coast_limit = self.coast_limit
-                    smoothed = self.quad_tracker.update(hand_result.roles)
-                    quad_pts = QuadTracker.quad_points(smoothed)
-
-                    active_quad_pts = quad_pts
-                    if local_endfade_mode and local_endfade_trigger_frame is not None:
-                        trigger = local_endfade_trigger_frame + local_endfade_offset
-                        if prev_frame_idx >= trigger:
-                            progress = min(1.0, (prev_frame_idx - trigger) / max(1, local_endfade_duration_frames))
-                            progress = progress * progress * (3 - 2 * progress)
-                            start_quad = local_endfade_base_quad if local_endfade_base_quad is not None else (quad_pts if quad_pts is not None else np.zeros((4,2)))
-                            target_quad = np.array([[0,0], [frame_w,0], [frame_w,frame_h], [0,frame_h]], dtype=np.float32)
-                            active_quad_pts = (start_quad * (1.0 - progress) + target_quad * progress).astype(np.int32)
-
-                    active_image_bgra = self.full_image_bgra
-                    if not getattr(self, "has_custom_image", True) and local_warp_mode:
-                        active_image_bgra = getattr(self, "full_grid_bgra", self.full_image_bgra)
-
-                    if local_warp_mode:
-                        out_frame = warp_composite_frame(prev_frame, active_quad_pts, active_image_bgra, feather=local_feather)
-                    else:
-                        if local_last_placement != local_placement or local_cached_canvas_bgr is None:
-                            local_cached_canvas_bgr, local_cached_canvas_alpha = build_canvas(active_image_bgra, local_placement, frame_w, frame_h)
-                            local_last_placement = local_placement.copy()
-                        out_frame = composite_frame(prev_frame, active_quad_pts, local_cached_canvas_bgr, local_cached_canvas_alpha, feather=local_feather)
-                        
-                    if getattr(self, "_render_debug", False):
-                        from src.debug_draw import draw_debug_overlay
-                        out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
-                        
-                    writer.write(out_frame)
-                    
-                    if prev_frame_idx % 10 == 0:
-                        self.position_changed.emit(prev_frame_idx)
+                    process_prev()
                 
                 if not ok and prev_frame is None:
                     break
@@ -631,9 +750,15 @@ class VideoProcessorThread(QThread):
                 prev_frame_idx = current_frame_idx
                 if ok:
                     current_frame_idx += 1
+
+            if prev_frame is not None and future_tracker is not None:
+                process_prev()
                     
         finally:
-            writer.close()
+            try:
+                writer.close()
+            except Exception as e:
+                self.error_occurred.emit(f"Failed to finalize webcam render: {e}")
             cap.release()
             try:
                 os.remove(raw_path)
@@ -642,8 +767,35 @@ class VideoProcessorThread(QThread):
 
 
     def stop(self):
-        self._running = False
+        self._set_flag('_running', False)
+        if getattr(self, '_raw_writer', None):
+            try:
+                self._raw_writer.terminate()
+            except Exception:
+                pass
+            self._raw_writer = None
+        if getattr(self, 'writer', None):
+            try:
+                self.writer.terminate()
+            except Exception:
+                pass
+            self.writer = None
         self.wait()
+
+
+class ImageAdjustDialog(QDialog):
+    def __init__(self, parent, frame_size, placement, warp_mode):
+        super().__init__(parent)
+        self.setWindowTitle("Image Adjust Editor")
+        self.setMinimumSize(820, 500)
+        layout = QVBoxLayout(self)
+        self.preview = PreviewLabel()
+        self.preview.setMinimumSize(800, 450)
+        self.preview.frame_size = frame_size
+        self.preview.warp_mode = warp_mode
+        self.preview.update_placement(placement)
+        self.preview.setText("")
+        layout.addWidget(self.preview)
 
 
 class MainWindow(QMainWindow):
@@ -663,10 +815,13 @@ class MainWindow(QMainWindow):
         self.processor.export_finished.connect(self.on_export_finished)
         self.processor.endfade_scan_progress.connect(self.on_endfade_progress)
         self.processor.endfade_scan_complete.connect(self.on_endfade_complete)
+        self.processor.resolution_changed.connect(self.on_resolution_changed)
         
         self.init_ui()
         self._is_webcam = False
         self._user_is_seeking = False
+        self._image_adjust_dialog = None
+        self._try_restore_session()
 
     def apply_clean_white_theme(self):
         palette = QPalette()
@@ -803,6 +958,10 @@ class MainWindow(QMainWindow):
         self.slider_y.valueChanged.connect(self.on_settings_changed_slider)
         place_layout.addRow("Y Offset:", self.slider_y)
 
+        self.btn_image_editor = QPushButton("Open Image Adjust Editor")
+        self.btn_image_editor.clicked.connect(self.open_image_adjust_editor)
+        place_layout.addRow(self.btn_image_editor)
+
         left_panel.addWidget(place_group)
 
         enc_group = QGroupBox("Encoding")
@@ -866,7 +1025,7 @@ class MainWindow(QMainWindow):
         export_opt_layout = QVBoxLayout(self.export_options_group)
         
         dir_layout = QHBoxLayout()
-        default_out_dir = os.path.join(os.getcwd(), "output")
+        default_out_dir = os.path.join(PROJECT_ROOT, "output")
         self.le_out_dir = QLineEdit(default_out_dir)
         self.btn_out_dir = QPushButton("Browse...")
         self.btn_out_dir.clicked.connect(self.select_out_dir)
@@ -900,6 +1059,84 @@ class MainWindow(QMainWindow):
         
         self._prevent_slider_feedback = False
 
+    def _save_session(self):
+        save_last_run({
+            "video": self.video_path,
+            "image": self.image_path,
+            "music": self.music_path,
+            "is_webcam": self._is_webcam,
+            "out_dir": self.le_out_dir.text(),
+        })
+
+    def _try_restore_session(self):
+        last_run = load_last_run()
+        if not last_run or not last_run.get("video"):
+            return
+        reply = QMessageBox.question(
+            self, "Restore Session",
+            "Restore settings from your last session?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        if last_run.get("out_dir"):
+            self.le_out_dir.setText(last_run["out_dir"])
+        if last_run.get("is_webcam") or str(last_run.get("video")) in ("0", 0):
+            self._is_webcam = True
+            self.video_path = "0"
+            self.btn_webcam.setText("Webcam: Active")
+        else:
+            self._is_webcam = False
+            self.video_path = last_run["video"]
+            if os.path.isfile(self.video_path):
+                self.btn_video.setText(os.path.basename(self.video_path))
+        if last_run.get("image") and os.path.isfile(last_run["image"]):
+            self.image_path = last_run["image"]
+            self.btn_image.setText(os.path.basename(self.image_path))
+        if last_run.get("music") and os.path.isfile(last_run["music"]):
+            self.music_path = last_run["music"]
+            self.btn_music.setText(os.path.basename(self.music_path))
+        if self.video_path:
+            self.update_controls_mode()
+            self.start_playback()
+
+    def open_image_adjust_editor(self):
+        if self._image_adjust_dialog is not None and self._image_adjust_dialog.isVisible():
+            self._image_adjust_dialog.raise_()
+            self._image_adjust_dialog.activateWindow()
+            return
+        placement = {
+            "x": self.slider_x.value(),
+            "y": self.slider_y.value(),
+            "scale": self.slider_scale.value() / 100.0,
+            "rotation_deg": self.slider_rot.value(),
+        }
+        self._image_adjust_dialog = ImageAdjustDialog(
+            self, self.video_label.frame_size, placement, self.cb_warp.isChecked(),
+        )
+        self._image_adjust_dialog.preview.placement_changed.connect(self.on_interactive_placement)
+        self._image_adjust_dialog.finished.connect(self._on_image_editor_closed)
+        self._image_adjust_dialog.show()
+
+    def _on_image_editor_closed(self):
+        if self._image_adjust_dialog:
+            self._image_adjust_dialog.preview.placement_changed.disconnect(self.on_interactive_placement)
+            self._image_adjust_dialog = None
+
+    @pyqtSlot(int, int)
+    def on_resolution_changed(self, frame_w, frame_h):
+        self.video_label.frame_size = (frame_w, frame_h)
+        self.slider_x.setRange(0, frame_w)
+        self.slider_y.setRange(0, frame_h)
+        cx, cy = frame_w // 2, frame_h // 2
+        self._prevent_slider_feedback = True
+        self.slider_x.setValue(cx)
+        self.slider_y.setValue(cy)
+        self._prevent_slider_feedback = False
+        self.processor.update_params({"placement": {"x": cx, "y": cy}})
+        if self._image_adjust_dialog and self._image_adjust_dialog.isVisible():
+            self._image_adjust_dialog.preview.frame_size = (frame_w, frame_h)
+
     def select_webcam(self):
         self._is_webcam = True
         self.video_path = "0"
@@ -907,6 +1144,7 @@ class MainWindow(QMainWindow):
         self.btn_webcam.setText("Webcam: Active")
         self.update_controls_mode()
         self.start_playback()
+        self._save_session()
 
     def select_video(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Video Files (*.mp4 *.mov *.avi *.mkv *.webm)")
@@ -917,6 +1155,7 @@ class MainWindow(QMainWindow):
             self.btn_webcam.setText("Use Webcam")
             self.update_controls_mode()
             self.start_playback()
+            self._save_session()
 
     def select_image(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)")
@@ -924,6 +1163,7 @@ class MainWindow(QMainWindow):
             self.image_path = path
             self.btn_image.setText(os.path.basename(path))
             self.start_playback()
+            self._save_session()
 
     def select_music(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Music", "", "Audio Files (*.mp3 *.wav *.m4a *.flac *.aac)")
@@ -931,6 +1171,7 @@ class MainWindow(QMainWindow):
             self.music_path = path
             self.btn_music.setText(os.path.basename(path))
             self.start_playback()
+            self._save_session()
 
     def update_controls_mode(self):
         if self._is_webcam:
@@ -967,6 +1208,14 @@ class MainWindow(QMainWindow):
     def on_settings_changed_slider(self):
         if not self._prevent_slider_feedback:
             self.on_settings_changed()
+        if self._image_adjust_dialog and self._image_adjust_dialog.isVisible():
+            placement = {
+                "x": self.slider_x.value(),
+                "y": self.slider_y.value(),
+                "scale": self.slider_scale.value() / 100.0,
+                "rotation_deg": self.slider_rot.value(),
+            }
+            self._image_adjust_dialog.preview.update_placement(placement)
 
     def on_settings_changed(self):
         self.video_label.warp_mode = self.cb_warp.isChecked()
@@ -1007,7 +1256,6 @@ class MainWindow(QMainWindow):
         self.lbl_ef_status.setText(f"Trigger: Frame {trigger_frame}")
         
     def on_interactive_placement(self, placement):
-        # Update sliders without triggering loop
         self._prevent_slider_feedback = True
         self.slider_x.setValue(int(placement["x"]))
         self.slider_y.setValue(int(placement["y"]))
@@ -1016,9 +1264,11 @@ class MainWindow(QMainWindow):
         self._prevent_slider_feedback = False
         
         self.processor.update_params({"placement": placement})
+        if self._image_adjust_dialog and self._image_adjust_dialog.isVisible():
+            self._image_adjust_dialog.preview.update_placement(placement)
 
     def toggle_play_pause(self):
-        if self.processor._paused:
+        if self.processor._get_flag('_paused'):
             self.processor.set_paused(False)
             self.btn_play_pause.setText("Pause")
         else:
@@ -1026,7 +1276,7 @@ class MainWindow(QMainWindow):
             self.btn_play_pause.setText("Play")
             
     def toggle_recording(self):
-        if self.processor._recording:
+        if self.processor._get_flag('_recording'):
             self.processor.stop_recording()
         else:
             self.processor.start_recording()
@@ -1039,7 +1289,7 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(False)
         self.progress_bar.setValue(0)
         self.progress_bar.show()
-        self.processor._rendering_webcam = True
+        self.processor.request_webcam_render()
         
     def on_recording_finished(self):
         self.btn_record.setEnabled(True)
@@ -1118,18 +1368,28 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(QImage)
     def update_frame(self, qimg):
-        # We don't scale here anymore, it's pre-scaled by the thread
         self.video_label.setPixmap(QPixmap.fromImage(qimg))
+        self.processor.ack_frame()
 
     @pyqtSlot(str)
     def show_error(self, msg):
+        self.btn_export.setEnabled(not self._is_webcam or os.path.exists(TEMP_RECORDING))
+        self.btn_export.setText("Export")
+        self.progress_bar.hide()
+        self.btn_record.setEnabled(True)
+        self.btn_record.setText("Start Recording")
+        self.btn_record.setStyleSheet("background-color: #f0f0f0; color: black; font-weight: bold;")
         QMessageBox.critical(self, "Error", msg)
 
     def closeEvent(self, event):
+        self._save_session()
         self.processor.stop()
-        if os.path.exists(TEMP_RECORDING):
-            try: os.remove(TEMP_RECORDING)
-            except: pass
+        for temp_path in (TEMP_RECORDING, RAW_TEMP_RECORDING):
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
         event.accept()
 
 def run_gui():
