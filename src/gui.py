@@ -434,7 +434,7 @@ class VideoProcessorThread(QThread):
                     h, w, ch = gui_frame.shape
                     bytes_per_line = ch * w
                     self._current_qimage_ref = gui_frame # Retain reference to prevent garbage collection
-                    qimg = QImage(gui_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                    qimg = QImage(gui_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
                     self.frame_ready.emit(qimg)
 
                     if not self.is_webcam:
@@ -452,8 +452,8 @@ class VideoProcessorThread(QThread):
             self.error_occurred.emit(str(e))
         finally:
             if self._executor:
-                self._executor.shutdown(wait=False)
-            if self.writer:
+                self._executor.shutdown(wait=True)
+            if getattr(self, 'writer', None):
                 self.writer.close()
                 self.writer = None
             if self.cap:
