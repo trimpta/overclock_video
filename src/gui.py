@@ -12,7 +12,7 @@ from PyQt6.QtGui import QImage, QPixmap, QPalette, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QPushButton, QFileDialog, QSlider, QCheckBox, 
-    QGroupBox, QFormLayout, QComboBox, QMessageBox, QStyle
+    QGroupBox, QFormLayout, QComboBox, QMessageBox, QStyle, QProgressBar
 )
 
 from src.audio_mux import FfmpegFrameWriter
@@ -33,6 +33,7 @@ class PreviewLabel(QLabel):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(640, 360)
         self.setStyleSheet("background-color: #fafafa; border: 1px solid #ddd; color: #333;")
+        self.setToolTip("Interactive Preview:\n- Click and drag the center to move the image.\n- Click and drag the edges to scale the image.")
         
         self.is_dragging = False
         self.drag_start_pos = None
@@ -228,10 +229,12 @@ class VideoProcessorThread(QThread):
         proxy_h = int(frame_h * self.proxy_scale)
 
         if self.image_path and os.path.isfile(self.image_path):
-            full_img = load_image_bgra(self.image_path)
-            self.image_bgra = cv2.resize(full_img, (proxy_w, proxy_h), interpolation=cv2.INTER_AREA)
+            self.full_image_bgra = load_image_bgra(self.image_path)
+            self.image_bgra = cv2.resize(self.full_image_bgra, (proxy_w, proxy_h), interpolation=cv2.INTER_AREA)
             self.has_custom_image = True
         else:
+            self.full_image_bgra = make_greenscreen_bgra(frame_w, frame_h)
+            self.full_grid_bgra = make_grid_bgra(frame_w, frame_h)
             self.image_bgra = make_greenscreen_bgra(proxy_w, proxy_h)
             self.grid_bgra = make_grid_bgra(proxy_w, proxy_h)
             self.has_custom_image = False
@@ -495,9 +498,9 @@ class VideoProcessorThread(QThread):
                             target_quad = np.array([[0,0], [frame_w,0], [frame_w,frame_h], [0,frame_h]], dtype=np.float32)
                             active_quad_pts = (start_quad * (1.0 - progress) + target_quad * progress).astype(np.int32)
 
-                    active_image_bgra = self.image_bgra
+                    active_image_bgra = self.full_image_bgra
                     if not getattr(self, "has_custom_image", True) and self.warp_mode:
-                        active_image_bgra = getattr(self, "grid_bgra", self.image_bgra)
+                        active_image_bgra = getattr(self, "full_grid_bgra", self.full_image_bgra)
 
                     if self.warp_mode:
                         out_frame = warp_composite_frame(prev_frame, active_quad_pts, active_image_bgra, feather=self.feather)
@@ -540,6 +543,10 @@ class VideoProcessorThread(QThread):
         if not cap.isOpened():
             self.error_occurred.emit("Could not read raw recording.")
             return
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames > 0:
+            self.duration_changed.emit(total_frames)
 
         writer = FfmpegFrameWriter(TEMP_RECORDING, frame_w, frame_h, fps, self.music_path, codec=self.codec, preset=self.preset)
         
@@ -588,9 +595,9 @@ class VideoProcessorThread(QThread):
                             target_quad = np.array([[0,0], [frame_w,0], [frame_w,frame_h], [0,frame_h]], dtype=np.float32)
                             active_quad_pts = (start_quad * (1.0 - progress) + target_quad * progress).astype(np.int32)
 
-                    active_image_bgra = self.image_bgra
+                    active_image_bgra = self.full_image_bgra
                     if not getattr(self, "has_custom_image", True) and local_warp_mode:
-                        active_image_bgra = getattr(self, "grid_bgra", self.image_bgra)
+                        active_image_bgra = getattr(self, "full_grid_bgra", self.full_image_bgra)
 
                     if local_warp_mode:
                         out_frame = warp_composite_frame(prev_frame, active_quad_pts, active_image_bgra, feather=local_feather)
@@ -708,6 +715,7 @@ class MainWindow(QMainWindow):
         comp_layout = QFormLayout(comp_group)
 
         self.cb_warp = QCheckBox("Enable Warp Mode")
+        self.cb_warp.setToolTip("Morphs and stretches the image dynamically to precisely match the 3D contour of your hands.\nIf disabled, the image acts as a static background layer (Standard Mode).")
         self.cb_warp.stateChanged.connect(self.on_settings_changed)
         comp_layout.addRow(self.cb_warp)
 
@@ -716,16 +724,19 @@ class MainWindow(QMainWindow):
         comp_layout.addRow(self.cb_debug)
         
         self.cb_endfade = QCheckBox("Enable Endfade Mode")
+        self.cb_endfade.setToolTip("Automatically identifies when your hands leave the frame near the end of the video,\nand transitions the image to fill the screen.")
         self.cb_endfade.stateChanged.connect(self.on_settings_changed)
         comp_layout.addRow(self.cb_endfade)
 
         self.slider_feather = QSlider(Qt.Orientation.Horizontal)
+        self.slider_feather.setToolTip("Applies a soft blur to the mask edges to blend the image seamlessly with the video.")
         self.slider_feather.setRange(0, 31)
         self.slider_feather.setValue(9)
         self.slider_feather.valueChanged.connect(self.on_settings_changed)
         comp_layout.addRow("Feather:", self.slider_feather)
 
         self.slider_coast = QSlider(Qt.Orientation.Horizontal)
+        self.slider_coast.setToolTip("How many frames the image persists after tracking is lost.\nUseful to cover up brief moments where MediaPipe fails to see your hands.")
         self.slider_coast.setRange(0, 60)
         self.slider_coast.setValue(0)
         self.slider_coast.valueChanged.connect(self.on_settings_changed)
@@ -786,6 +797,13 @@ class MainWindow(QMainWindow):
         enc_group = QGroupBox("Encoding")
         enc_layout = QFormLayout(enc_group)
         self.cb_codec = QComboBox()
+        self.cb_codec.setToolTip(
+            "Select the hardware encoder for exporting:\n"
+            "- libx264 (CPU): Slowest but highest compatibility. Uses your processor.\n"
+            "- h264_nvenc (NVIDIA): Blazing fast GPU acceleration for NVIDIA graphics cards.\n"
+            "- h264_qsv (Intel): Quick Sync Video for Intel integrated graphics.\n"
+            "- h264_amf (AMD): Hardware encoding for AMD Radeon GPUs."
+        )
         self.cb_codec.addItems(["libx264 (CPU)", "h264_nvenc (NVIDIA)", "h264_qsv (Intel)", "h264_amf (AMD)"])
         self.cb_codec.currentIndexChanged.connect(self.on_settings_changed)
         enc_layout.addRow("Codec:", self.cb_codec)
@@ -824,6 +842,13 @@ class MainWindow(QMainWindow):
         self.btn_record.clicked.connect(self.toggle_recording)
         self.btn_record.hide()
         bottom_layout.addWidget(self.btn_record)
+        
+        # Render Progress Bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.hide()
+        bottom_layout.addWidget(self.progress_bar)
         
         # Unified Export button
         self.btn_export = QPushButton("Export")
@@ -970,6 +995,8 @@ class MainWindow(QMainWindow):
         self.btn_record.setEnabled(False)
         self.btn_record.setText("Rendering...")
         self.btn_export.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
         self.processor._rendering_webcam = True
         
     def on_recording_finished(self):
@@ -977,6 +1004,7 @@ class MainWindow(QMainWindow):
         self.btn_record.setText("Start Recording")
         self.btn_record.setStyleSheet("background-color: #f0f0f0; color: black; font-weight: bold;")
         self.btn_export.setEnabled(True)
+        self.progress_bar.hide()
 
     def do_export(self):
         out_path, _ = QFileDialog.getSaveFileName(self, "Save Video As", "output.mp4", "Video Files (*.mp4)")
@@ -994,11 +1022,14 @@ class MainWindow(QMainWindow):
             # Render the video in background
             self.btn_export.setEnabled(False)
             self.btn_export.setText("Exporting...")
+            self.progress_bar.setValue(0)
+            self.progress_bar.show()
             self.processor.start_export(out_path)
             
     def on_export_finished(self):
         self.btn_export.setEnabled(True)
         self.btn_export.setText("Export")
+        self.progress_bar.hide()
         QMessageBox.information(self, "Export Complete", "Video rendering finished successfully.")
 
     def on_timeline_pressed(self):
@@ -1015,11 +1046,13 @@ class MainWindow(QMainWindow):
     @pyqtSlot(int)
     def update_timeline_range(self, total_frames):
         self.timeline.setRange(0, total_frames)
+        self.progress_bar.setRange(0, total_frames)
 
     @pyqtSlot(int)
     def update_timeline_pos(self, frame_idx):
         if not self._user_is_seeking:
             self.timeline.setValue(frame_idx)
+        self.progress_bar.setValue(frame_idx)
 
     @pyqtSlot(QImage)
     def update_frame(self, qimg):
