@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Overclock Video: track both thumbs + index fingers in a video, and reveal
-a static image through the quadrilateral they form, set to a music track.
+an image (or a greenscreen placeholder, if none is given) through the
+quadrilateral they form, optionally set to a music track.
 
-Run with no arguments for an interactive wizard, or pass flags directly:
+Run with no arguments to auto-detect inputs in the current directory (or get
+prompted for whichever ones are ambiguous), or pass flags directly:
     python overclock.py --video in.mp4 --image pic.png --music song.mp3 --mode debug
 """
 import os
@@ -15,7 +17,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.audio_mux import FfmpegFrameWriter
 from src.cli import resolve_args
-from src.compositor import build_canvas, composite_frame, load_image_bgra
+from src.compositor import (
+    build_canvas,
+    composite_frame,
+    full_frame_placement,
+    load_image_bgra,
+    make_greenscreen_bgra,
+)
 from src.config import load_placement, save_placement
 from src.debug_draw import draw_debug_overlay
 from src.hand_tracking import HandTracker
@@ -43,28 +51,37 @@ def main():
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
 
-    image_bgra = load_image_bgra(args.image)
-
     ok, first_frame = cap.read()
     if not ok:
         print("Could not read the first frame of the video.")
         sys.exit(1)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    # Deliberately not seeking back to frame 0 here: CAP_PROP_POS_FRAMES
+    # seeks are unreliable on some codecs (e.g. HEVC from phone cameras) and
+    # can crash the process. Instead, first_frame is fed into the render
+    # loop below as frame 0, and cap just continues from frame 1.
 
-    placement = None if args.reposition else load_placement(args.placement_config)
-    if placement is not None and not args.reposition:
-        choice = wizard.ask_reuse_placement(args.placement_config)
-        if choice == "redo":
-            placement = None
+    if args.image is None:
+        # No image supplied: fill the whole frame with a greenscreen. A
+        # uniform fill needs no positioning, so skip placement entirely.
+        image_bgra = make_greenscreen_bgra(frame_w, frame_h)
+        placement = full_frame_placement(frame_w, frame_h)
+    else:
+        image_bgra = load_image_bgra(args.image)
 
-    if placement is None:
-        print("\nOpening interactive placement window...")
-        placement = run_placement_ui(first_frame, image_bgra, initial_placement=placement)
+        placement = None if args.reposition else load_placement(args.placement_config)
+        if placement is not None and not args.reposition:
+            choice = wizard.ask_reuse_placement(args.placement_config)
+            if choice == "redo":
+                placement = None
+
         if placement is None:
-            print("Placement cancelled.")
-            sys.exit(1)
-        save_placement(args.placement_config, placement)
-        print(f"Saved placement to {args.placement_config}")
+            print("\nOpening interactive placement window...")
+            placement = run_placement_ui(first_frame, image_bgra, initial_placement=placement)
+            if placement is None:
+                print("Placement cancelled.")
+                sys.exit(1)
+            save_placement(args.placement_config, placement)
+            print(f"Saved placement to {args.placement_config}")
 
     canvas_bgr, canvas_alpha = build_canvas(image_bgra, placement, frame_w, frame_h)
 
@@ -72,15 +89,19 @@ def main():
     quad_tracker = QuadTracker(coast_limit=args.coast_limit)
     writer = FfmpegFrameWriter(args.output, frame_w, frame_h, fps, args.music)
 
+    def frames():
+        yield first_frame
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                return
+            yield frame
+
     print(f"\nRendering ({args.mode} mode) -> {args.output}")
     frame_idx = 0
     start_time = time.time()
     try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-
+        for frame in frames():
             timestamp_ms = int((frame_idx / fps) * 1000)
             hand_result = tracker.process(frame, timestamp_ms)
             smoothed = quad_tracker.update(hand_result.roles)

@@ -19,6 +19,25 @@ def load_image_bgra(path: str):
     return img
 
 
+# Standard chroma-key green (BGR order).
+GREENSCREEN_BGR = (0, 177, 64)
+
+
+def make_greenscreen_bgra(frame_w: int, frame_h: int):
+    """A fully opaque, frame-sized solid-green placeholder used when no
+    image is supplied. Since it's a uniform fill, it covers the whole quad
+    regardless of placement, so it needs no interactive positioning.
+    """
+    canvas = np.zeros((frame_h, frame_w, 4), dtype=np.uint8)
+    canvas[:, :, :3] = GREENSCREEN_BGR
+    canvas[:, :, 3] = 255
+    return canvas
+
+
+def full_frame_placement(frame_w: int, frame_h: int):
+    return {"x": frame_w / 2, "y": frame_h / 2, "scale": 1.0, "rotation_deg": 0.0}
+
+
 def build_canvas(image_bgra, placement: dict, frame_w: int, frame_h: int):
     """Bakes the static image (scaled + rotated once, per placement) onto a
     frame-sized canvas. Returns (canvas_bgr uint8 HxWx3, canvas_alpha uint8 HxW).

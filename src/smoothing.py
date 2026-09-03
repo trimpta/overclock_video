@@ -41,7 +41,7 @@ class PointSmoother:
                 return None, None, False, True
 
             pred = self._kf.predict()
-            return float(pred[0]), float(pred[1]), True, False
+            return float(pred[0, 0]), float(pred[1, 0]), True, False
 
         x, y = measurement_xy
         if not self._initialized:
@@ -53,7 +53,7 @@ class PointSmoother:
         self._kf.predict()
         corrected = self._kf.correct(np.array([[x], [y]], dtype=np.float32))
         self.missed_frames = 0
-        return float(corrected[0]), float(corrected[1]), False, False
+        return float(corrected[0, 0]), float(corrected[1, 0]), False, False
 
 
 class QuadTracker:

@@ -39,9 +39,12 @@ def _find_files(exts, search_dirs=(".",)):
     return unique
 
 
-def ask_file_path(kind_label: str, exts: tuple, search_dirs=(".",)):
+def ask_file_path(kind_label: str, exts: tuple, search_dirs=(".",), none_label: str = None):
+    """none_label: if set, adds an option returning None (e.g. "No image / use greenscreen")."""
     candidates = _find_files(exts, search_dirs)
     options = [(f"{c}", c) for c in candidates]
+    if none_label:
+        options.append((none_label, None))
     options.append(("Enter a path manually", "__manual__"))
 
     choice = menu_choice(f"Select the {kind_label} file:", options)
@@ -53,28 +56,6 @@ def ask_file_path(kind_label: str, exts: tuple, search_dirs=(".",)):
         if os.path.isfile(raw):
             return raw
         print(f"File not found: {raw}")
-
-
-def ask_output_path(default_path: str):
-    options = [
-        (f"Use default: {default_path}", default_path),
-        ("Enter a custom path", "__manual__"),
-    ]
-    choice = menu_choice("Where should the rendered video be saved?", options)
-    if choice != "__manual__":
-        return choice
-    raw = input("Output path: ").strip().strip('"')
-    return raw or default_path
-
-
-def ask_mode():
-    return menu_choice(
-        "Which mode?",
-        [
-            ("debug - show hand/finger tracking overlay", "debug"),
-            ("render - final output, no overlay", "render"),
-        ],
-    )
 
 
 def ask_reuse_placement(config_path: str):
