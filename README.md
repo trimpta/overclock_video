@@ -8,6 +8,7 @@ Optionally mixes in a music track.
 - **debug** mode overlays the full hand skeleton, the 4 tracked fingertips, and
   the tracked quadrilateral outline (with labels/confidence/prediction state).
 - **render** mode (the default) outputs the final composite with no overlay.
+- **live** mode streams real-time webcam feed with optional looping audio in a live window (press `R` to toggle debug overlay, `Q`/`Esc` to quit).
 
 The image does not warp to the quad — it sits at a fixed position/scale/rotation
 you set once via an interactive preview window, and the quad acts purely as a

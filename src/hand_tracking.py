@@ -57,26 +57,37 @@ class HandTracker:
             min_tracking_confidence=min_tracking_confidence,
         )
         self._landmarker = HandLandmarker.create_from_options(options)
+        self._last_timestamp_ms = -1
 
     def process(self, frame_bgr, timestamp_ms: int) -> HandFrameResult:
+        import cv2
+
         h, w = frame_bgr.shape[:2]
-        rgb = frame_bgr[:, :, ::-1]
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        # MediaPipe VIDEO mode requires strictly monotonically increasing timestamps
+        if timestamp_ms <= self._last_timestamp_ms:
+            timestamp_ms = self._last_timestamp_ms + 1
+        self._last_timestamp_ms = timestamp_ms
+
         result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
 
         out = HandFrameResult()
         seen_labels = set()
 
+        # Combine landmark and handedness results and sort by confidence score descending
+        detections = []
         for hand_landmarks, handedness in zip(result.hand_landmarks, result.handedness):
             top = handedness[0]
-            label = top.category_name  # "Left" or "Right"
-            score = top.score
+            detections.append((top.score, top.category_name, hand_landmarks))
+        detections.sort(key=lambda d: d[0], reverse=True)
 
+        for score, label, hand_landmarks in detections:
             points_px = [(lm.x * w, lm.y * h) for lm in hand_landmarks]
             out.hands_raw.append(RawHand(label=label, score=score, points_px=points_px))
 
-            # If MediaPipe reports two hands with the same label, keep the
-            # higher-confidence one and ignore the duplicate.
+            # If MediaPipe reports two hands with the same label, keep the higher-confidence one (first in sorted)
             if label in ("Left", "Right"):
                 if label in seen_labels:
                     continue

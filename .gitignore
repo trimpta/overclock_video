@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .venv/
 /output/
+*_overclocked.mp4
+*_placement.json
+.last_run.json
