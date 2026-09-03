@@ -49,7 +49,8 @@ def build_canvas(image_bgra, placement: dict, frame_w: int, frame_h: int):
     cx = placement.get("x", frame_w / 2)
     cy = placement.get("y", frame_h / 2)
 
-    scaled = cv2.resize(image_bgra, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    scaled = cv2.resize(image_bgra, (0, 0), fx=scale, fy=scale, interpolation=interp)
     h, w = scaled.shape[:2]
 
     if abs(rotation_deg) > 1e-3:
@@ -93,7 +94,7 @@ def composite_frame(frame_bgr, quad_pts, canvas_bgr, canvas_alpha, feather: int 
 
     h, w = frame_bgr.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillConvexPoly(mask, quad_pts, 255)
+    cv2.fillPoly(mask, [quad_pts], 255)
 
     if feather > 0:
         k = feather | 1  # ensure odd kernel size
@@ -103,4 +104,46 @@ def composite_frame(frame_bgr, quad_pts, canvas_bgr, canvas_alpha, feather: int 
     alpha = alpha[:, :, None]
 
     out = frame_bgr.astype(np.float32) * (1 - alpha) + canvas_bgr.astype(np.float32) * alpha
+    return out.astype(np.uint8)
+
+
+def warp_composite_frame(frame_bgr, quad_pts, image_bgra, feather: int = 9):
+    """Warps the raw image_bgra to fit exactly into quad_pts. The quad_pts must be
+    ordered as TL, TR, BR, BL (which QuadTracker.quad_points provides).
+    """
+    if quad_pts is None:
+        return frame_bgr
+
+    h, w = frame_bgr.shape[:2]
+    img_h, img_w = image_bgra.shape[:2]
+
+    src_pts = np.array([
+        [0, 0],
+        [img_w, 0],
+        [img_w, img_h],
+        [0, img_h]
+    ], dtype=np.float32)
+
+    dst_pts = quad_pts.astype(np.float32)
+
+    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    warped = cv2.warpPerspective(
+        image_bgra, M, (w, h),
+        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0)
+    )
+
+    warped_bgr = warped[:, :, :3]
+    warped_alpha = warped[:, :, 3]
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [quad_pts], 255)
+
+    if feather > 0:
+        k = feather | 1
+        mask = cv2.GaussianBlur(mask, (k, k), 0)
+
+    alpha = (mask.astype(np.float32) / 255.0) * (warped_alpha.astype(np.float32) / 255.0)
+    alpha = alpha[:, :, None]
+
+    out = frame_bgr.astype(np.float32) * (1 - alpha) + warped_bgr.astype(np.float32) * alpha
     return out.astype(np.uint8)
