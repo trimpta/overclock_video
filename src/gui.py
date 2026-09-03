@@ -56,19 +56,17 @@ class PreviewLabel(QLabel):
         self.current_placement.update(placement)
 
     def _content_rect(self):
-        """Letterboxed destination rect of the displayed pixmap inside the label."""
+        """Painted pixmap rect: QLabel centers an unscaled pixmap in contentsRect."""
         pm = self.pixmap()
         if pm is None or pm.isNull():
             return None
-        pw, ph = pm.width(), pm.height()
-        lw, lh = self.width(), self.height()
-        if pw <= 0 or ph <= 0 or lw <= 0 or lh <= 0:
+        cr = self.contentsRect()
+        pw, ph = float(pm.width()), float(pm.height())
+        if pw <= 0 or ph <= 0 or cr.width() <= 0 or cr.height() <= 0:
             return None
-        scale = min(lw / pw, lh / ph)
-        cw, ch = pw * scale, ph * scale
-        x = (lw - cw) / 2.0
-        y = (lh - ch) / 2.0
-        return QRectF(x, y, cw, ch)
+        x = cr.x() + (cr.width() - pw) / 2.0
+        y = cr.y() + (cr.height() - ph) / 2.0
+        return QRectF(x, y, pw, ph)
 
     def mousePressEvent(self, event):
         if self.warp_mode: return
@@ -78,7 +76,7 @@ class PreviewLabel(QLabel):
                 return
 
             self.is_dragging = True
-            self.drag_start_pos = event.pos()
+            self.drag_start_pos = event.position()
 
             # Determine drag mode in content coordinates (ignore letterbox bars)
             x = event.position().x() - content.x()
@@ -99,8 +97,9 @@ class PreviewLabel(QLabel):
         if content is None:
             return
 
-        delta = event.pos() - self.drag_start_pos
-        self.drag_start_pos = event.pos()
+        pos = event.position()
+        delta = pos - self.drag_start_pos
+        self.drag_start_pos = pos
 
         scale_x = self.frame_size[0] / max(1.0, content.width())
         scale_y = self.frame_size[1] / max(1.0, content.height())
@@ -320,6 +319,10 @@ class VideoProcessorThread(QThread):
             self.error_occurred.emit("No video source selected.")
             return None
 
+        if not os.path.isfile(MODEL_PATH):
+            self.error_occurred.emit(f"Hand tracking model not found:\n{MODEL_PATH}")
+            return None
+
         self._reset_endfade_state()
 
         if self.is_webcam:
@@ -331,7 +334,7 @@ class VideoProcessorThread(QThread):
 
         if not self.cap.isOpened():
             self.error_occurred.emit(f"Could not open video source: {self.video_path}")
-            self.cap = None
+            self._end_session()
             return None
 
         fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -368,11 +371,6 @@ class VideoProcessorThread(QThread):
             self.full_image_bgra = make_greenscreen_bgra(frame_w, frame_h)
             self.image_bgra = make_greenscreen_bgra(proxy_w, proxy_h)
             self.has_custom_image = False
-
-        if not os.path.isfile(MODEL_PATH):
-            self.error_occurred.emit(f"Hand tracking model not found:\n{MODEL_PATH}")
-            self._end_session()
-            return None
 
         self.tracker = HandTracker(MODEL_PATH, num_hands=2)
         self.quad_tracker = QuadTracker(coast_limit=self.coast_limit)
@@ -643,6 +641,14 @@ class VideoProcessorThread(QThread):
 
                         current_future = self._executor.submit(self.tracker.process, proxy_frame, timestamp_ms)
 
+                        force_preview = self._get_flag('_force_preview_frame')
+                        if force_preview and prev_frame is None:
+                            # Seek-while-paused: composite this read immediately (#32).
+                            prev_frame = frame
+                            proxy_prev_frame = proxy_frame
+                            future_tracker = current_future
+                            prev_frame_idx = current_frame_idx
+
                         if prev_frame is not None and future_tracker is not None:
                             if not self.is_webcam:
                                 self.position_changed.emit(prev_frame_idx)
@@ -672,10 +678,14 @@ class VideoProcessorThread(QThread):
                                 from src.debug_draw import draw_debug_overlay
                                 out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
 
-                            force_preview = self._get_flag('_force_preview_frame')
                             self._emit_gui_frame(out_frame, fps, force=force_preview)
                             if force_preview:
                                 self._set_flag('_force_preview_frame', False)
+                                prev_frame = frame
+                                proxy_prev_frame = proxy_frame
+                                future_tracker = None
+                                prev_frame_idx = current_frame_idx
+                                continue
 
                         prev_frame = frame
                         proxy_prev_frame = proxy_frame
@@ -1172,7 +1182,6 @@ class MainWindow(QMainWindow):
         self.timeline = QSlider(Qt.Orientation.Horizontal)
         self.timeline.sliderPressed.connect(self.on_timeline_pressed)
         self.timeline.sliderReleased.connect(self.on_timeline_released)
-        self.timeline.valueChanged.connect(self.on_timeline_moved)
         self.timeline.hide()
         bottom_layout.addWidget(self.timeline)
         
@@ -1307,10 +1316,14 @@ class MainWindow(QMainWindow):
             self.slider_x.setValue(cx)
             self.slider_y.setValue(cy)
             self._prevent_slider_feedback = False
-            self.processor.update_params({"placement": {"x": cx, "y": cy}})
+            center = {"x": cx, "y": cy}
+            self.processor.update_params({"placement": center})
+            self.video_label.update_placement(center)
             self._last_frame_size = (frame_w, frame_h)
         if self._image_adjust_dialog and self._image_adjust_dialog.isVisible():
             self._image_adjust_dialog.preview.frame_size = (frame_w, frame_h)
+            if size_changed:
+                self._image_adjust_dialog.preview.update_placement({"x": frame_w // 2, "y": frame_h // 2})
 
     def select_webcam(self):
         self._is_webcam = True
@@ -1383,13 +1396,14 @@ class MainWindow(QMainWindow):
     def on_settings_changed_slider(self):
         if not self._prevent_slider_feedback:
             self.on_settings_changed()
+        placement = {
+            "x": self.slider_x.value(),
+            "y": self.slider_y.value(),
+            "scale": self.slider_scale.value() / 100.0,
+            "rotation_deg": self.slider_rot.value(),
+        }
+        self.video_label.update_placement(placement)
         if self._image_adjust_dialog and self._image_adjust_dialog.isVisible():
-            placement = {
-                "x": self.slider_x.value(),
-                "y": self.slider_y.value(),
-                "scale": self.slider_scale.value() / 100.0,
-                "rotation_deg": self.slider_rot.value(),
-            }
             self._image_adjust_dialog.preview.update_placement(placement)
 
     def on_settings_changed(self):
@@ -1450,6 +1464,7 @@ class MainWindow(QMainWindow):
         self._prevent_slider_feedback = False
         
         self.processor.update_params({"placement": placement})
+        self.video_label.update_placement(placement)
         if self._image_adjust_dialog and self._image_adjust_dialog.isVisible():
             self._image_adjust_dialog.preview.update_placement(placement)
 
@@ -1537,10 +1552,6 @@ class MainWindow(QMainWindow):
         self._user_is_seeking = False
         self.processor.request_seek(self.timeline.value())
 
-    def on_timeline_moved(self, value):
-        # Seek only on sliderReleased — valueChanged fires on every drag tick (#35).
-        pass
-
     @pyqtSlot(int)
     def update_timeline_range(self, total_frames):
         self.timeline.setRange(0, total_frames)
@@ -1549,7 +1560,9 @@ class MainWindow(QMainWindow):
     @pyqtSlot(int)
     def update_timeline_pos(self, frame_idx):
         if not self._user_is_seeking:
+            self.timeline.blockSignals(True)
             self.timeline.setValue(frame_idx)
+            self.timeline.blockSignals(False)
         self.progress_bar.setValue(frame_idx)
 
     @pyqtSlot(QImage)
