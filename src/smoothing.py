@@ -60,7 +60,21 @@ class QuadTracker:
     """Tracks the 4 fingertip roles and produces a smoothed quad each frame."""
 
     def __init__(self, coast_limit: int = DEFAULT_COAST_LIMIT):
+        self._coast_limit = coast_limit
         self._smoothers = {role: PointSmoother(coast_limit) for role in ROLE_KEYS}
+
+    @property
+    def coast_limit(self):
+        return self._coast_limit
+
+    @coast_limit.setter
+    def coast_limit(self, value):
+        self._coast_limit = value
+        for smoother in self._smoothers.values():
+            smoother.coast_limit = value
+
+    def reset(self):
+        self._smoothers = {role: PointSmoother(self._coast_limit) for role in ROLE_KEYS}
 
     def update(self, roles: dict):
         """roles: dict role -> (x, y, score) or None.

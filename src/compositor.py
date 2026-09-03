@@ -116,6 +116,10 @@ def composite_frame(frame_bgr, quad_pts, canvas_bgr, canvas_alpha, feather: int 
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(mask, [quad_pts], 255)
 
+    if canvas_bgr.shape[:2] != (h, w) or canvas_alpha.shape[:2] != (h, w):
+        # Cache/frame size mismatch — skip composite rather than crash OpenCV
+        return frame_bgr
+
     if feather > 0:
         k = feather | 1  # ensure odd kernel size
         mask = cv2.GaussianBlur(mask, (k, k), 0)
@@ -125,7 +129,7 @@ def composite_frame(frame_bgr, quad_pts, canvas_bgr, canvas_alpha, feather: int 
 
     frame_16 = frame_bgr.astype(np.uint16)
     canvas_16 = canvas_bgr.astype(np.uint16)
-    
+
     out_16 = frame_16 * (255 - alpha_3ch) + canvas_16 * alpha_3ch
     out = (out_16 // 255).astype(np.uint8)
     return out

@@ -22,7 +22,8 @@ def load_last_run(path: str = DEFAULT_LAST_RUN_PATH):
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if data.get("video") and not os.path.isfile(data["video"]):
+        video = data.get("video")
+        if video and video not in ("0", 0) and not str(video).isdigit() and not os.path.isfile(video):
             return None
         if data.get("image") and not os.path.isfile(data["image"]):
             return None

@@ -16,11 +16,7 @@ class FfmpegFrameWriter:
             "-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(fps),
             "-i", "-",
         ]
-        
-        # Some hardware encoders don't support the 'preset' flag in the same way, 
-        # so we only use it for libx264 or known compatible ones, or we just pass it and hope it works.
-        # NVENC uses p1-p7 or slow/medium/fast.
-        
+
         if music_path:
             cmd.extend([
                 "-stream_loop", "-1", "-i", music_path,
@@ -31,7 +27,7 @@ class FfmpegFrameWriter:
                 cmd.extend(["-preset", preset, "-crf", "18"])
             elif codec == "h264_nvenc":
                 cmd.extend(["-preset", "p4", "-cq", "18"])
-            
+
             cmd.extend([
                 "-c:a", "aac", "-b:a", "192k",
                 "-shortest",
@@ -49,19 +45,64 @@ class FfmpegFrameWriter:
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
+        self.failed = False
+        self.error_message = None
+        self._closed = False
 
     def write(self, frame_bgr):
+        if self.failed or self._closed:
+            return False
         try:
             self._proc.stdin.write(frame_bgr.tobytes())
-        except (BrokenPipeError, OSError):
-            pass  # It will be handled in close()
+            return True
+        except (BrokenPipeError, OSError) as e:
+            self.failed = True
+            self.error_message = f"ffmpeg pipe broken during write: {e}"
+            return False
 
     def close(self):
+        if self._closed:
+            if self.failed:
+                raise RuntimeError(self.error_message or "ffmpeg writer already failed")
+            return
+        self._closed = True
         try:
-            if self._proc.stdin:
+            if self._proc.stdin and not self._proc.stdin.closed:
                 self._proc.stdin.close()
         except (BrokenPipeError, OSError):
+            self.failed = True
+        try:
+            _, stderr = self._proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.terminate()
+            _, stderr = self._proc.communicate()
+            self.failed = True
+            self.error_message = "ffmpeg timed out during close"
+            raise RuntimeError(self.error_message)
+
+        stderr_text = (stderr or b"").decode(errors="replace").strip()
+        if self._proc.returncode not in (0, None):
+            self.failed = True
+            self.error_message = f"ffmpeg failed (code {self._proc.returncode}):\n{stderr_text}"
+            raise RuntimeError(self.error_message)
+        if self.failed:
+            raise RuntimeError(self.error_message or f"ffmpeg failed:\n{stderr_text}")
+
+    def terminate(self):
+        if self._closed and self._proc.poll() is not None:
+            return
+        try:
+            if self._proc.stdin and not self._proc.stdin.closed:
+                self._proc.stdin.close()
+        except Exception:
             pass
-        _, stderr = self._proc.communicate()
-        if self._proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed:\n{stderr.decode(errors='replace')}")
+        try:
+            self._proc.kill()
+        except Exception:
+            pass
+        try:
+            self._proc.communicate(timeout=5)
+        except Exception:
+            pass
+        self._closed = True
+        self.failed = True
