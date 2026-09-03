@@ -9,7 +9,7 @@ from .hand_tracking import ROLE_KEYS
 
 # How many consecutive frames a point may be "coasted" (predicted with no
 # fresh measurement) before we give up and treat it as lost for that frame.
-DEFAULT_COAST_LIMIT = 45  # ~1.5s at 30fps
+DEFAULT_COAST_LIMIT = 0  # Hide mask immediately when tracking is lost
 
 
 class PointSmoother:
@@ -81,13 +81,14 @@ class QuadTracker:
 
     @staticmethod
     def quad_points(smoothed: dict):
-        """Returns the 4 polygon points in winding order (TL, TR, BR, BL) for
+        """Returns the 4 polygon points in winding order around their centroid for
         fillPoly, or None if any of the 4 fingertips is currently lost.
         """
-        if any(smoothed[role]["lost"] for role in ROLE_KEYS):
+        if any(smoothed[role]["lost"] or smoothed[role]["pos"] is None for role in ROLE_KEYS):
             return None
-        tl = smoothed["left_index"]["pos"]
-        tr = smoothed["right_index"]["pos"]
-        br = smoothed["right_thumb"]["pos"]
-        bl = smoothed["left_thumb"]["pos"]
-        return np.array([tl, tr, br, bl], dtype=np.int32)
+        pts = [smoothed[role]["pos"] for role in ROLE_KEYS]
+        cx = sum(p[0] for p in pts) / 4.0
+        cy = sum(p[1] for p in pts) / 4.0
+        # Sort points by angle relative to centroid to ensure a simple non-self-intersecting polygon
+        pts_sorted = sorted(pts, key=lambda p: np.arctan2(p[1] - cy, p[0] - cx))
+        return np.array(pts_sorted, dtype=np.int32)
