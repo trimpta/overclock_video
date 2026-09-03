@@ -158,20 +158,6 @@ class VideoProcessorThread(QThread):
 
     def stop_recording(self):
         self._recording = False
-        if self._raw_writer is not None:
-            self._raw_writer.close()
-            self._raw_writer = None
-            self._render_params_snapshot = {
-                "warp_mode": self.warp_mode,
-                "placement": self.placement.copy(),
-                "feather": self.feather,
-                "endfade_mode": self.endfade_mode,
-                "endfade_offset": self.endfade_offset,
-                "endfade_duration_frames": self.endfade_duration_frames,
-                "endfade_base_quad": self.endfade_base_quad.copy() if self.endfade_base_quad is not None else None,
-                "endfade_trigger_frame": self.endfade_trigger_frame,
-            }
-            self.raw_recording_ready.emit()
         
     def start_export(self, export_path):
         self.export_path = export_path
@@ -368,8 +354,19 @@ class VideoProcessorThread(QThread):
                         self._raw_writer.write(frame)
                 else:
                     if self._raw_writer is not None:
-                        # Will be closed by stop_recording() cleanly, but just in case
-                        pass
+                        self._raw_writer.close()
+                        self._raw_writer = None
+                        self._render_params_snapshot = {
+                            "warp_mode": self.warp_mode,
+                            "placement": self.placement.copy(),
+                            "feather": self.feather,
+                            "endfade_mode": self.endfade_mode,
+                            "endfade_offset": self.endfade_offset,
+                            "endfade_duration_frames": self.endfade_duration_frames,
+                            "endfade_base_quad": self.endfade_base_quad.copy() if self.endfade_base_quad is not None else None,
+                            "endfade_trigger_frame": self.endfade_trigger_frame,
+                        }
+                        self.raw_recording_ready.emit()
                 
                 # Submit tracking to background executor
                 current_future = self._executor.submit(self.tracker.process, proxy_frame, timestamp_ms)
