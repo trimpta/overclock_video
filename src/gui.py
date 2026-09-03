@@ -411,7 +411,10 @@ class VideoProcessorThread(QThread):
                         out_frame = warp_composite_frame(proxy_prev_frame, active_quad_pts, active_image_bgra, feather=self.feather)
                     else:
                         if self._last_placement != self.placement or self._cached_canvas_bgr is None:
-                            self._cached_canvas_bgr, self._cached_canvas_alpha = build_canvas(active_image_bgra, self.placement, proxy_w, proxy_h)
+                            proxy_placement = self.placement.copy()
+                            proxy_placement["x"] = proxy_placement["x"] * self.proxy_scale
+                            proxy_placement["y"] = proxy_placement["y"] * self.proxy_scale
+                            self._cached_canvas_bgr, self._cached_canvas_alpha = build_canvas(active_image_bgra, proxy_placement, proxy_w, proxy_h)
                             self._last_placement = self.placement.copy()
                         out_frame = composite_frame(proxy_prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=self.feather)
 
