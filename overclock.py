@@ -1,64 +1,45 @@
 #!/usr/bin/env python3
-"""Overclock Video: track both thumbs + index fingers in a video, and reveal
-an image (or a greenscreen placeholder, if none is given) through the
-quadrilateral they form, optionally set to a music track.
+"""Overclock Video: track both thumbs + index fingers and reveal an image
+through the quadrilateral they form, optionally set to a music track.
 
-Run with no arguments to auto-detect inputs in the current directory (or get
-prompted for whichever ones are ambiguous), or pass flags directly:
-    python overclock.py --video in.mp4 --image pic.png --music song.mp3 --mode debug
+Launch the GUI with no arguments:
+    python overclock.py
 """
 import os
 import sys
-import time
-
-import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.audio_mux import FfmpegFrameWriter
-from src.cli import resolve_args
-from src.compositor import (
-    build_canvas,
-    composite_frame,
-    full_frame_placement,
-    load_image_bgra,
-    make_greenscreen_bgra,
-)
-from src.config import load_placement, save_placement
-from src.debug_draw import draw_debug_overlay
-from src.hand_tracking import HandTracker
-from src.placement_ui import run_placement_ui
-from src.smoothing import QuadTracker
-from src import wizard
+GUI_HELP = """\
+Overclock Video - GUI app
 
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "hand_landmarker.task")
+Usage:
+  python overclock.py          Launch the GUI
+  python overclock.py --help   Show this help
 
+Setup:
+  setup.bat                    (Windows) create venv, install deps, launch
+  pip install -r requirements.txt && python overclock.py
 
-def open_video_capture(video_arg):
-    if isinstance(video_arg, int):
-        return cv2.VideoCapture(video_arg), True
-    v_str = str(video_arg).strip()
-    if v_str.isdigit() or v_str.lower() == "webcam":
-        idx = int(v_str) if v_str.isdigit() else 0
-        return cv2.VideoCapture(idx), True
-    return cv2.VideoCapture(video_arg), False
+In the GUI: webcam or video file, optional image/music, warp mode, endfade,
+export codecs, image adjust editor, and session restore.
+
+Legacy CLI flags are deprecated; the GUI is the supported path.
+"""
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] not in ("--help", "-h"):
-        # Keep old CLI behavior if arguments are provided
-        args = resolve_args()
-        
-        if not os.path.isfile(MODEL_PATH):
-            print(f"Missing hand tracking model at {MODEL_PATH}")
-            sys.exit(1)
-            
-        print("CLI mode is deprecated. Running without arguments will launch the GUI.")
-        # We'll just exit here to enforce GUI usage, as the CLI is being phased out in this update
-        print("Please run `python overclock.py` with no arguments to use the new GUI.")
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg in ("--help", "-h"):
+            print(GUI_HELP, end="")
+            sys.exit(0)
+
+        print("CLI mode is deprecated.")
+        print("Please run `python overclock.py` with no arguments to use the GUI.")
+        print("For usage help: python overclock.py --help")
         sys.exit(1)
-        
-    # Launch GUI
+
     try:
         from src.gui import run_gui
         run_gui()
@@ -66,6 +47,7 @@ def main():
         print(f"Failed to load GUI: {e}")
         print("Make sure PyQt6 is installed: pip install PyQt6")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

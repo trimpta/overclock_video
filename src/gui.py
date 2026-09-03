@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import concurrent.futures
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import Qt, QThread, QRectF, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QImage, QPixmap, QPalette, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -20,7 +20,7 @@ from src.audio_mux import FfmpegFrameWriter
 from src.config import load_last_run, save_last_run
 from src.compositor import build_canvas, composite_frame, warp_composite_frame, load_image_bgra, make_greenscreen_bgra, make_grid_bgra, full_frame_placement
 from src.hand_tracking import HandTracker
-from src.smoothing import QuadTracker
+from src.smoothing import QuadTracker, order_points_tl_tr_br_bl
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "hand_landmarker.task")
 PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -55,18 +55,38 @@ class PreviewLabel(QLabel):
     def update_placement(self, placement):
         self.current_placement.update(placement)
 
+    def _content_rect(self):
+        """Letterboxed destination rect of the displayed pixmap inside the label."""
+        pm = self.pixmap()
+        if pm is None or pm.isNull():
+            return None
+        pw, ph = pm.width(), pm.height()
+        lw, lh = self.width(), self.height()
+        if pw <= 0 or ph <= 0 or lw <= 0 or lh <= 0:
+            return None
+        scale = min(lw / pw, lh / ph)
+        cw, ch = pw * scale, ph * scale
+        x = (lw - cw) / 2.0
+        y = (lh - ch) / 2.0
+        return QRectF(x, y, cw, ch)
+
     def mousePressEvent(self, event):
         if self.warp_mode: return
         if event.button() == Qt.MouseButton.LeftButton:
+            content = self._content_rect()
+            if content is None or not content.contains(event.position()):
+                return
+
             self.is_dragging = True
             self.drag_start_pos = event.pos()
-            
-            # Determine if we are dragging the center or the edges
-            w, h = self.width(), self.height()
-            x, y = event.pos().x(), event.pos().y()
+
+            # Determine drag mode in content coordinates (ignore letterbox bars)
+            x = event.position().x() - content.x()
+            y = event.position().y() - content.y()
+            w, h = content.width(), content.height()
             margin_x, margin_y = w * 0.2, h * 0.2
-            
-            # If clicked in the outer 20% border, we scale. If inner 60%, we translate.
+
+            # Outer 20% border = scale; inner 60% = translate.
             if x < margin_x or x > w - margin_x or y < margin_y or y > h - margin_y:
                 self.drag_mode = "scale"
             else:
@@ -74,14 +94,17 @@ class PreviewLabel(QLabel):
 
     def mouseMoveEvent(self, event):
         if not self.is_dragging or self.warp_mode: return
-        
+
+        content = self._content_rect()
+        if content is None:
+            return
+
         delta = event.pos() - self.drag_start_pos
         self.drag_start_pos = event.pos()
-        
-        # Heuristic coordinate mapping
-        scale_x = self.frame_size[0] / max(1, self.width())
-        scale_y = self.frame_size[1] / max(1, self.height())
-        
+
+        scale_x = self.frame_size[0] / max(1.0, content.width())
+        scale_y = self.frame_size[1] / max(1.0, content.height())
+
         if self.drag_mode == "translate":
             dx = delta.x() * scale_x
             dy = delta.y() * scale_y
@@ -89,9 +112,9 @@ class PreviewLabel(QLabel):
             self.current_placement["y"] += dy
         elif self.drag_mode == "scale":
             # Dragging up/right increases scale, down/left decreases
-            scale_delta = (delta.x() - delta.y()) * 0.005 
+            scale_delta = (delta.x() - delta.y()) * 0.005
             self.current_placement["scale"] = max(0.01, self.current_placement["scale"] + scale_delta)
-            
+
         self.placement_changed.emit(self.current_placement)
 
     def mouseReleaseEvent(self, event):
@@ -110,6 +133,7 @@ class VideoProcessorThread(QThread):
     export_finished = pyqtSignal()
     endfade_scan_progress = pyqtSignal(int, int)
     endfade_scan_complete = pyqtSignal(int, np.ndarray)
+    endfade_scan_failed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -131,6 +155,8 @@ class VideoProcessorThread(QThread):
         self._running = False
         self._paused = False
         self._seek_request = None
+        self._needs_restart = False
+        self._force_preview_frame = False
         
         self.endfade_mode = False
         self._scanning_endfade = False
@@ -175,6 +201,17 @@ class VideoProcessorThread(QThread):
 
     def ack_frame(self):
         self._gui_frame_pending = False
+
+    @staticmethod
+    def _drain_future(future):
+        """Wait for an in-flight tracker future so process/reset stay single-threaded."""
+        if future is None:
+            return None
+        try:
+            future.result()
+        except Exception:
+            pass
+        return None
 
     def request_webcam_render(self):
         self._set_flag('_rendering_webcam', True)
@@ -304,7 +341,19 @@ class VideoProcessorThread(QThread):
             self.cap = cv2.VideoCapture(self.video_path)
 
         if not self.cap.isOpened():
+            self._set_flag('_running', False)
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
             self.error_occurred.emit(f"Could not open video source: {self.video_path}")
+            return
+
+        if not os.path.isfile(MODEL_PATH):
+            self._set_flag('_running', False)
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
+            self.error_occurred.emit(f"Hand landmark model not found: {MODEL_PATH}")
             return
 
         fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -340,16 +389,19 @@ class VideoProcessorThread(QThread):
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._gui_frame_pending = False
         
-        start_time = time.time()
-        
         future_tracker = None
         prev_frame = None
         proxy_prev_frame = None
         prev_frame_idx = 0
+        preview_frame_idx = 0
+        webcam_frame_idx = 0
         
         try:
             while self._get_flag('_running'):
                 if self._get_flag('_exporting') and not self.is_webcam:
+                    future_tracker = self._drain_future(future_tracker)
+                    prev_frame = None
+                    proxy_prev_frame = None
                     try:
                         self._run_export_loop(frame_w, frame_h, fps)
                         self.export_finished.emit()
@@ -361,6 +413,9 @@ class VideoProcessorThread(QThread):
                     continue
                     
                 if self._get_flag('_rendering_webcam') and self.is_webcam:
+                    future_tracker = self._drain_future(future_tracker)
+                    prev_frame = None
+                    proxy_prev_frame = None
                     self._run_webcam_render_loop(frame_w, frame_h, fps)
                     self._set_flag('_rendering_webcam', False)
                     self.recording_finished.emit()
@@ -368,11 +423,12 @@ class VideoProcessorThread(QThread):
                 
                 seek_req = self._get_flag('_seek_request')
                 if seek_req is not None and not self.is_webcam:
+                    future_tracker = self._drain_future(future_tracker)
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, seek_req)
                     self._set_flag('_seek_request', None)
-                    future_tracker = None
                     prev_frame = None
                     proxy_prev_frame = None
+                    preview_frame_idx = seek_req
                     self.quad_tracker.reset()
                     self.tracker.reset()
                     
@@ -381,6 +437,13 @@ class VideoProcessorThread(QThread):
                     continue
 
                 if self._get_flag('_scanning_endfade') and not self.is_webcam:
+                    # Drain any in-flight tracker work before synchronous endfade scan (#21/#22).
+                    future_tracker = self._drain_future(future_tracker)
+                    prev_frame = None
+                    proxy_prev_frame = None
+                    self.tracker.reset()
+                    self.quad_tracker.reset()
+
                     last_valid_frame = -1
                     last_quad = None
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -411,12 +474,19 @@ class VideoProcessorThread(QThread):
                         self.endfade_scan_complete.emit(last_valid_frame, self.endfade_base_quad)
                     else:
                         self.endfade_mode = False
-                        self.error_occurred.emit("Endfade Scan failed: No hands detected in the video.")
+                        self.endfade_scan_failed.emit("Endfade Scan failed: No hands detected in the video.")
+
+                    # Clear endfade scan timestamp state before returning to preview (#22).
+                    self.tracker.reset()
+                    self.quad_tracker.reset()
                         
                     if last_valid_frame != -1:
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, last_valid_frame - int(fps)))
+                        resume_idx = max(0, last_valid_frame - int(fps))
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, resume_idx)
+                        preview_frame_idx = resume_idx
                     else:
                         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        preview_frame_idx = 0
                     continue
 
                 ok, frame = self.cap.read()
@@ -425,12 +495,14 @@ class VideoProcessorThread(QThread):
                         time.sleep(0.01)
                         continue
                     else:
+                        future_tracker = self._drain_future(future_tracker)
                         if self.endfade_mode and self.endfade_trigger_frame is not None:
                             loop_start = max(0, self.endfade_trigger_frame + self.endfade_offset - int(fps))
                             self.cap.set(cv2.CAP_PROP_POS_FRAMES, loop_start)
+                            preview_frame_idx = loop_start
                         else:
                             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        future_tracker = None
+                            preview_frame_idx = 0
                         prev_frame = None
                         proxy_prev_frame = None
                         self.quad_tracker.reset()
@@ -439,11 +511,15 @@ class VideoProcessorThread(QThread):
                 
                 if self.is_webcam:
                     frame = cv2.flip(frame, 1)
+                    current_frame_idx = webcam_frame_idx
+                    timestamp_ms = int((webcam_frame_idx / fps) * 1000)
+                    webcam_frame_idx += 1
+                else:
+                    current_frame_idx = preview_frame_idx
+                    timestamp_ms = int((preview_frame_idx / fps) * 1000)
+                    preview_frame_idx += 1
                 
                 proxy_frame = cv2.resize(frame, (proxy_w, proxy_h), interpolation=cv2.INTER_LINEAR)
-                
-                current_frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) if not self.is_webcam else 0
-                timestamp_ms = int((time.time() - start_time) * 1000)
                 
                 if self._get_flag('_recording') and self.is_webcam:
                     if self._raw_writer is None:
@@ -815,6 +891,7 @@ class MainWindow(QMainWindow):
         self.processor.export_finished.connect(self.on_export_finished)
         self.processor.endfade_scan_progress.connect(self.on_endfade_progress)
         self.processor.endfade_scan_complete.connect(self.on_endfade_complete)
+        self.processor.endfade_scan_failed.connect(self.on_endfade_scan_failed)
         self.processor.resolution_changed.connect(self.on_resolution_changed)
         
         self.init_ui()
@@ -1254,7 +1331,16 @@ class MainWindow(QMainWindow):
     @pyqtSlot(int, np.ndarray)
     def on_endfade_complete(self, trigger_frame, last_quad):
         self.lbl_ef_status.setText(f"Trigger: Frame {trigger_frame}")
-        
+
+    @pyqtSlot(str)
+    def on_endfade_scan_failed(self, msg):
+        self.cb_endfade.blockSignals(True)
+        self.cb_endfade.setChecked(False)
+        self.cb_endfade.blockSignals(False)
+        self.endfade_group.hide()
+        self.lbl_ef_status.setText("Scan failed")
+        QMessageBox.critical(self, "Error", msg)
+
     def on_interactive_placement(self, placement):
         self._prevent_slider_feedback = True
         self.slider_x.setValue(int(placement["x"]))

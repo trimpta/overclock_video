@@ -7,6 +7,8 @@ warps or moves on its own.
 import cv2
 import numpy as np
 
+from .smoothing import order_points_tl_tr_br_bl
+
 
 def load_image_bgra(path: str):
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
@@ -136,8 +138,11 @@ def composite_frame(frame_bgr, quad_pts, canvas_bgr, canvas_alpha, feather: int 
 
 
 def warp_composite_frame(frame_bgr, quad_pts, image_bgra, feather: int = 9):
-    """Warps the raw image_bgra to fit exactly into quad_pts. The quad_pts must be
-    ordered as TL, TR, BR, BL (which QuadTracker.quad_points provides).
+    """Warps the raw image_bgra to fit exactly into quad_pts.
+
+    Destination corners are forced to TL, TR, BR, BL via
+    ``order_points_tl_tr_br_bl`` so callers may pass unsorted quads
+    (e.g. angle-sorted ``QuadTracker.quad_points``).
     """
     if quad_pts is None:
         return frame_bgr
@@ -152,7 +157,8 @@ def warp_composite_frame(frame_bgr, quad_pts, image_bgra, feather: int = 9):
         [0, img_h]
     ], dtype=np.float32)
 
-    dst_pts = quad_pts.astype(np.float32)
+    dst_pts = order_points_tl_tr_br_bl(quad_pts)
+    ordered_i32 = np.round(dst_pts).astype(np.int32)
 
     M = cv2.getPerspectiveTransform(src_pts, dst_pts)
     warped = cv2.warpPerspective(
@@ -164,7 +170,7 @@ def warp_composite_frame(frame_bgr, quad_pts, image_bgra, feather: int = 9):
     warped_alpha = warped[:, :, 3]
 
     mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(mask, [quad_pts], 255)
+    cv2.fillPoly(mask, [ordered_i32], 255)
 
     if feather > 0:
         k = feather | 1

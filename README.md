@@ -1,74 +1,42 @@
 # Overclock Video
 
-Tracks both thumbs and index fingertips in a video (via MediaPipe hand landmarks),
-and reveals an image through the quadrilateral those 4 fingertips form — like
-looking through a hand-shaped window at a picture placed behind the video.
-Optionally mixes in a music track.
-
-- **debug** mode overlays the full hand skeleton, the 4 tracked fingertips, and
-  the tracked quadrilateral outline (with labels/confidence/prediction state).
-- **render** mode (the default) outputs the final composite with no overlay.
-- **live** mode streams real-time webcam feed with optional looping audio in a live window (press `R` to toggle debug overlay, `Q`/`Esc` to quit).
-
-The image does not warp to the quad — it sits at a fixed position/scale/rotation
-you set once via an interactive preview window, and the quad acts purely as a
-mask revealing whatever part of it currently falls underneath.
-
-Output resolution always matches the input video's resolution.
+A PyQt6 desktop app that tracks both thumbs and index fingertips (via MediaPipe hand landmarks) and reveals an image through the quadrilateral those four fingertips form — like looking through a hand-shaped window at a picture behind the video. Optionally mixes in a music track.
 
 ## Setup
 
+**Windows (recommended):** double-click or run `setup.bat`. It creates a `.venv`, installs dependencies, and launches the GUI.
+
+**Manual:**
+
 ```bash
 pip install -r requirements.txt
+python overclock.py
 ```
 
-The MediaPipe hand-landmark model (`models/hand_landmarker.task`) is included.
-Audio muxing uses a bundled ffmpeg binary via `imageio-ffmpeg` — no separate
-ffmpeg install required.
+The MediaPipe hand-landmark model (`models/hand_landmarker.task`) is included. Audio muxing and export use a bundled ffmpeg binary via `imageio-ffmpeg` — no separate ffmpeg install required.
 
 ## Usage
 
-Simplest case: drop a video (and optionally an image and/or a music file) in
-the project directory and run with no arguments:
+Run with no arguments to open the GUI:
 
 ```bash
 python overclock.py
 ```
 
-Input resolution rules, per file type:
+In the app you can:
 
-- Exactly one match in the directory → used automatically, no prompt.
-- Multiple matches → you're asked to pick one (or, for image/music, to skip it).
-- **Video**: required — if none is found you're prompted for a path.
-- **Image**: optional — if none is found, a solid greenscreen fills the frame instead.
-- **Music**: optional — if none is found, the output has no audio.
+- **Webcam / live** — use a live camera feed, record, then export
+- **Video file** — load a clip, preview with timeline seek/pause, then export
+- **Optional image** — reveal through the hand quad (otherwise a greenscreen/grid placeholder)
+- **Optional music** — mux into the exported video
+- **Warp mode** — morph the image to the hand quad (vs. static placement as a masked layer)
+- **Endfade** — when hands leave near the end of a file, transition the image to fill the frame
+- **Export codecs** — `libx264` (CPU), or hardware encoders (`h264_nvenc`, `h264_qsv`, `h264_amf`)
+- **Image Adjust Editor** — drag/scale/rotate placement in a dedicated preview window
+- **Session restore** — on launch, optionally restore last video/image/music/output settings
 
-Mode defaults to `render`. Output defaults to `output/<video>_overclocked.mp4`.
+Output resolution matches the input video (or webcam) resolution. Exports go to the chosen output directory (default: `output/`).
 
-Or pass everything explicitly:
+## CLI note
 
-```bash
-python overclock.py --video in.mp4 --image pic.png --music song.mp3 --mode debug
-```
-
-The first time you run against a given video+image pair (skipped entirely for
-the greenscreen fallback, since a solid fill needs no positioning), an
-interactive window opens so you can drag/scale/rotate the image into place:
-
-- Drag with the left mouse button to move it
-- Mouse wheel or `+`/`-` to scale
-- `Q`/`E` to rotate
-- `R` to reset, `Enter` to confirm, `Esc` to cancel
-
-That placement is saved to a JSON file in the output directory so re-renders
-(or switching between debug/render mode) don't require repositioning — pass
-`--reposition` to redo it.
-
-## Other flags
-
-- `--output PATH` — output file (default: `output/<video>_overclocked.mp4`)
-- `--placement-config PATH` — explicit placement JSON path
-- `--coast-limit N` — frames a lost fingertip may be predicted before the
-  image hides for that frame (default: 45)
-- `--feather N` — mask edge softening in pixels (default: 9, 0 to disable)
-- `--preview` — show a live window while processing (debug mode only)
+The supported entry point is the GUI (`python overclock.py` with no args). Legacy CLI modules remain in the repo for reference, but CLI flags are deprecated — passing them prints a short message pointing you to the GUI.

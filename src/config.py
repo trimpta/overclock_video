@@ -26,9 +26,9 @@ def load_last_run(path: str = DEFAULT_LAST_RUN_PATH):
         if video and video not in ("0", 0) and not str(video).isdigit() and not os.path.isfile(video):
             return None
         if data.get("image") and not os.path.isfile(data["image"]):
-            return None
+            data["image"] = None
         if data.get("music") and not os.path.isfile(data["music"]):
-            return None
+            data["music"] = None
         return data
     except Exception:
         return None
