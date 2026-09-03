@@ -41,3 +41,40 @@ def save_last_run(data: dict, path: str = DEFAULT_LAST_RUN_PATH):
             json.dump(data, f, indent=2)
     except Exception as e:
         print(f"Warning: Could not save session settings ({e})")
+
+
+def session_compositing_settings(data):
+    """Extract placement/warp/endfade/feather/coast/codec from last-run JSON."""
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    placement = data.get("placement")
+    if isinstance(placement, dict):
+        try:
+            out["placement"] = {
+                "x": float(placement.get("x", 960)),
+                "y": float(placement.get("y", 540)),
+                "scale": float(placement.get("scale", 1.0)),
+                "rotation_deg": float(placement.get("rotation_deg", 0.0)),
+            }
+        except (TypeError, ValueError):
+            pass
+    if "warp_mode" in data:
+        out["warp_mode"] = bool(data["warp_mode"])
+    if "endfade_mode" in data:
+        out["endfade_mode"] = bool(data["endfade_mode"])
+    for key, caster in (
+        ("endfade_offset", int),
+        ("endfade_duration", int),
+        ("feather", int),
+        ("coast_limit", int),
+    ):
+        if key in data and data[key] is not None:
+            try:
+                out[key] = caster(data[key])
+            except (TypeError, ValueError):
+                pass
+    codec = data.get("codec")
+    if isinstance(codec, str) and codec.strip():
+        out["codec"] = codec.strip().split(" ")[0]
+    return out

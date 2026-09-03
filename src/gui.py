@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.audio_mux import FfmpegFrameWriter
-from src.config import load_last_run, save_last_run
+from src.config import load_last_run, save_last_run, session_compositing_settings
 from src.compositor import build_canvas, composite_frame, warp_composite_frame, load_image_bgra, make_greenscreen_bgra, make_grid_bgra, full_frame_placement
 from src.hand_tracking import HandTracker
 from src.smoothing import QuadTracker, order_points_tl_tr_br_bl
@@ -272,6 +272,72 @@ class VideoProcessorThread(QThread):
             return np.round(pts).astype(np.int32)
         return QuadTracker.quad_points(smoothed)
 
+    @staticmethod
+    def _clamp_fps(fps, default=30.0):
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            return default
+        if fps <= 0 or fps > 120:
+            return default
+        return fps
+
+    @staticmethod
+    def _measured_fps(frame_count, t0, fallback=30.0):
+        if t0 is None or frame_count <= 0:
+            return fallback
+        elapsed = time.perf_counter() - t0
+        if elapsed <= 1e-6:
+            return fallback
+        return VideoProcessorThread._clamp_fps(frame_count / elapsed, fallback)
+
+    def _snapshot_render_params(self, fps=None):
+        snap = {
+            "warp_mode": self.warp_mode,
+            "placement": self.placement.copy(),
+            "feather": self.feather,
+            "coast_limit": self.coast_limit,
+            "endfade_mode": self.endfade_mode,
+            "endfade_offset": self.endfade_offset,
+            "endfade_duration_frames": self.endfade_duration_frames,
+            "endfade_base_quad": self.endfade_base_quad.copy() if self.endfade_base_quad is not None else None,
+            "endfade_base_quad_proxy": self.endfade_base_quad_proxy.copy() if self.endfade_base_quad_proxy is not None else None,
+            "endfade_trigger_frame": self.endfade_trigger_frame,
+            "codec": self.codec,
+            "is_webcam": self.is_webcam,
+        }
+        if fps is not None:
+            snap["fps"] = self._clamp_fps(fps)
+        return snap
+
+    def _abort_raw_writer(self, message=None):
+        if message:
+            self.error_occurred.emit(message)
+        if self._raw_writer is not None:
+            try:
+                self._raw_writer.terminate()
+            except Exception:
+                pass
+            self._raw_writer = None
+        self._set_flag('_recording', False)
+
+    def _open_raw_writer(self, frame_w, frame_h, fps):
+        fps = self._clamp_fps(fps)
+        self._raw_writer = FfmpegFrameWriter(
+            RAW_TEMP_RECORDING, frame_w, frame_h, fps, codec="libx264", preset="ultrafast",
+        )
+        return fps
+
+    def _write_raw_frames(self, frames):
+        if self._raw_writer is None:
+            return False
+        for frame in frames:
+            if not self._raw_writer.write(frame) or self._raw_writer.failed:
+                err = self._raw_writer.error_message or "Raw recording write failed."
+                self._abort_raw_writer(err)
+                return False
+        return True
+
     def _clear_canvas_cache(self):
         self._cached_canvas_bgr = None
         self._cached_canvas_alpha = None
@@ -337,8 +403,11 @@ class VideoProcessorThread(QThread):
             self._end_session()
             return None
 
-        fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
-        if fps <= 0 or fps > 120: fps = 30.0
+        if self.is_webcam:
+            # CAP_PROP_FPS is often 0/wrong for cameras; measure while recording (#51).
+            fps = 30.0
+        else:
+            fps = self._clamp_fps(self.cap.get(cv2.CAP_PROP_FPS), 30.0)
         frame_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = None if self.is_webcam else int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -381,9 +450,10 @@ class VideoProcessorThread(QThread):
             self._set_flag('_scanning_endfade', True)
         return fps, frame_w, frame_h, total_frames, proxy_w, proxy_h
 
-    def _ensure_canvas(self, active_image_bgra, placement, cache_w, cache_h, proxy_scale=1.0):
+    def _ensure_canvas(self, active_image_bgra, placement, cache_w, cache_h, proxy_scale=1.0, warp_mode=None):
         cache_key_size = (cache_w, cache_h)
-        if not getattr(self, "has_custom_image", True) and not self.warp_mode:
+        use_warp = self.warp_mode if warp_mode is None else warp_mode
+        if not getattr(self, "has_custom_image", True) and not use_warp:
             if self._cached_canvas_bgr is None or self._cached_canvas_size != cache_key_size:
                 self._cached_canvas_bgr = active_image_bgra[:, :, :3].copy()
                 self._cached_canvas_alpha = active_image_bgra[:, :, 3].copy()
@@ -399,19 +469,27 @@ class VideoProcessorThread(QThread):
             self._cached_canvas_size = cache_key_size
 
     def _compute_endfade_quad(self, prev_frame_idx, quad_pts, frame_w, frame_h, proxy_w, proxy_h, use_proxy=False,
-                               endfade_base_quad=None, endfade_base_quad_proxy=None):
-        if not self.endfade_mode or self.endfade_trigger_frame is None or self.is_webcam:
+                               endfade_base_quad=None, endfade_base_quad_proxy=None, params=None):
+        p = params if params is not None else {}
+        endfade_mode = p.get("endfade_mode", self.endfade_mode)
+        trigger_frame = p.get("endfade_trigger_frame", self.endfade_trigger_frame)
+        offset = p.get("endfade_offset", self.endfade_offset)
+        duration = p.get("endfade_duration_frames", self.endfade_duration_frames)
+        is_webcam = p.get("is_webcam", self.is_webcam)
+        if not endfade_mode or trigger_frame is None or is_webcam:
             return quad_pts
-        trigger = self.endfade_trigger_frame + self.endfade_offset
+        trigger = trigger_frame + offset
         if prev_frame_idx < trigger:
             return quad_pts
-        progress = min(1.0, (prev_frame_idx - trigger) / max(1, self.endfade_duration_frames))
+        progress = min(1.0, (prev_frame_idx - trigger) / max(1, duration))
         progress = progress * progress * (3 - 2 * progress)
         if use_proxy:
-            start_quad = endfade_base_quad_proxy if endfade_base_quad_proxy is not None else (quad_pts if quad_pts is not None else np.zeros((4, 2)))
+            start_quad = p.get("endfade_base_quad_proxy", endfade_base_quad_proxy)
+            start_quad = start_quad if start_quad is not None else (quad_pts if quad_pts is not None else np.zeros((4, 2)))
             target_quad = np.array([[0, 0], [proxy_w, 0], [proxy_w, proxy_h], [0, proxy_h]], dtype=np.float32)
         else:
-            start_quad = endfade_base_quad if endfade_base_quad is not None else (quad_pts if quad_pts is not None else np.zeros((4, 2)))
+            start_quad = p.get("endfade_base_quad", endfade_base_quad)
+            start_quad = start_quad if start_quad is not None else (quad_pts if quad_pts is not None else np.zeros((4, 2)))
             target_quad = np.array([[0, 0], [frame_w, 0], [frame_w, frame_h], [0, frame_h]], dtype=np.float32)
         active_quad_pts = (start_quad * (1.0 - progress) + target_quad * progress).astype(np.int32)
         if active_quad_pts is not None and quad_pts is None:
@@ -438,8 +516,8 @@ class VideoProcessorThread(QThread):
             qimg = QImage(gui_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
             self._gui_frame_pending = True
             self.frame_ready.emit(qimg)
-        if not force:
-            time.sleep(1.0 / fps)
+        if not force and not self.is_webcam:
+            time.sleep(1.0 / max(fps, 1.0))
 
     def run(self):
         self._set_flag('_running', True)
@@ -463,6 +541,11 @@ class VideoProcessorThread(QThread):
                 prev_frame_idx = 0
                 preview_frame_idx = 0
                 webcam_frame_idx = 0
+                rec_t0 = None
+                rec_n = 0
+                rec_pending = []
+                rec_writer_fps = None
+                webcam_t0 = None
 
                 try:
                     while self._get_flag('_running') and not self._get_flag('_needs_restart'):
@@ -526,7 +609,7 @@ class VideoProcessorThread(QThread):
                                 t_ms = int((frame_idx / fps) * 1000)
                                 hr = self.tracker.process(proxy_f, t_ms)
                                 sm = self.quad_tracker.update(hr.roles)
-                                qp = QuadTracker.quad_points(sm)
+                                qp = QuadTracker.ordered_quad_points(sm)
                                 if qp is not None:
                                     last_valid_frame = frame_idx
                                     last_quad = qp.copy()
@@ -585,59 +668,84 @@ class VideoProcessorThread(QThread):
                                 continue
 
                         if self.is_webcam:
-                            frame = cv2.flip(frame, 1)
+                            # Track unflipped; mirror only for display/record (#46).
                             current_frame_idx = webcam_frame_idx
-                            timestamp_ms = int((webcam_frame_idx / fps) * 1000)
+                            if webcam_t0 is None:
+                                webcam_t0 = time.perf_counter()
+                            timestamp_ms = int((time.perf_counter() - webcam_t0) * 1000)
                             webcam_frame_idx += 1
+                            record_frame = cv2.flip(frame, 1)
                         else:
                             current_frame_idx = preview_frame_idx
                             timestamp_ms = int((preview_frame_idx / fps) * 1000)
                             preview_frame_idx += 1
+                            record_frame = None
 
                         proxy_frame = cv2.resize(frame, (proxy_w, proxy_h), interpolation=cv2.INTER_LINEAR)
 
                         if self._get_flag('_recording') and self.is_webcam:
+                            if rec_t0 is None:
+                                rec_t0 = time.perf_counter()
+                                rec_n = 0
+                                rec_pending = []
+                            rec_n += 1
                             if self._raw_writer is None:
-                                try:
-                                    self._raw_writer = FfmpegFrameWriter(RAW_TEMP_RECORDING, frame_w, frame_h, fps, codec="libx264", preset="ultrafast")
-                                except Exception as e:
-                                    self.error_occurred.emit(f"Failed to start raw recording: {e}")
-                                    self._set_flag('_recording', False)
-
-                            if self._raw_writer:
-                                if not self._raw_writer.write(frame) or self._raw_writer.failed:
-                                    self.error_occurred.emit(self._raw_writer.error_message or "Raw recording write failed.")
-                                    self._set_flag('_recording', False)
+                                rec_pending.append(record_frame)
+                                dt = time.perf_counter() - rec_t0
+                                nbuf = len(rec_pending)
+                                if (dt >= 0.4 and nbuf >= 8) or nbuf >= 45 or dt >= 1.5:
+                                    rec_writer_fps = self._measured_fps(nbuf, rec_t0, fallback=30.0)
                                     try:
-                                        self._raw_writer.terminate()
-                                    except Exception:
-                                        pass
-                                    self._raw_writer = None
-                        else:
-                            if self._raw_writer is not None:
+                                        rec_writer_fps = self._open_raw_writer(frame_w, frame_h, rec_writer_fps)
+                                    except Exception as e:
+                                        self._abort_raw_writer(f"Failed to start raw recording: {e}")
+                                        rec_t0 = None
+                                        rec_n = 0
+                                        rec_pending = []
+                                    else:
+                                        if not self._write_raw_frames(rec_pending):
+                                            rec_t0 = None
+                                            rec_n = 0
+                                        rec_pending = []
+                            else:
+                                if not self._write_raw_frames([record_frame]):
+                                    rec_t0 = None
+                                    rec_n = 0
+                                    rec_pending = []
+                        elif self.is_webcam and (self._raw_writer is not None or rec_pending):
+                            if self._raw_writer is None and rec_pending:
+                                rec_writer_fps = self._measured_fps(len(rec_pending), rec_t0, fallback=30.0)
                                 try:
-                                    self._raw_writer.close()
+                                    rec_writer_fps = self._open_raw_writer(frame_w, frame_h, rec_writer_fps)
                                 except Exception as e:
-                                    self.error_occurred.emit(f"Failed to finalize recording: {e}")
-                                    self._raw_writer = None
+                                    self._abort_raw_writer(f"Failed to start raw recording: {e}")
+                                    rec_t0 = None
+                                    rec_n = 0
+                                    rec_pending = []
                                     continue
+                                if not self._write_raw_frames(rec_pending):
+                                    rec_t0 = None
+                                    rec_n = 0
+                                    rec_pending = []
+                                    continue
+                                rec_pending = []
+                            overall_fps = self._measured_fps(rec_n, rec_t0, fallback=rec_writer_fps or 30.0)
+                            rec_t0 = None
+                            rec_n = 0
+                            rec_pending = []
+                            rec_writer_fps = None
+                            try:
+                                self._raw_writer.close()
+                            except Exception as e:
+                                self.error_occurred.emit(f"Failed to finalize recording: {e}")
                                 self._raw_writer = None
-                                if not os.path.isfile(RAW_TEMP_RECORDING) or os.path.getsize(RAW_TEMP_RECORDING) == 0:
-                                    self.error_occurred.emit("Recording file missing or empty after stop.")
-                                    continue
-                                self._render_params_snapshot = {
-                                    "warp_mode": self.warp_mode,
-                                    "placement": self.placement.copy(),
-                                    "feather": self.feather,
-                                    "coast_limit": self.coast_limit,
-                                    "endfade_mode": self.endfade_mode,
-                                    "endfade_offset": self.endfade_offset,
-                                    "endfade_duration_frames": self.endfade_duration_frames,
-                                    "endfade_base_quad": self.endfade_base_quad.copy() if self.endfade_base_quad is not None else None,
-                                    "endfade_base_quad_proxy": self.endfade_base_quad_proxy.copy() if self.endfade_base_quad_proxy is not None else None,
-                                    "endfade_trigger_frame": self.endfade_trigger_frame,
-                                }
-                                self.raw_recording_ready.emit()
+                                continue
+                            self._raw_writer = None
+                            if not os.path.isfile(RAW_TEMP_RECORDING) or os.path.getsize(RAW_TEMP_RECORDING) == 0:
+                                self.error_occurred.emit("Recording file missing or empty after stop.")
+                                continue
+                            self._render_params_snapshot = self._snapshot_render_params(fps=overall_fps)
+                            self.raw_recording_ready.emit()
 
                         current_future = self._executor.submit(self.tracker.process, proxy_frame, timestamp_ms)
 
@@ -677,6 +785,9 @@ class VideoProcessorThread(QThread):
                             if self.show_debug:
                                 from src.debug_draw import draw_debug_overlay
                                 out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
+
+                            if self.is_webcam:
+                                out_frame = cv2.flip(out_frame, 1)
 
                             self._emit_gui_frame(out_frame, fps, force=force_preview)
                             if force_preview:
@@ -723,11 +834,19 @@ class VideoProcessorThread(QThread):
 
     def _run_export_loop(self, frame_w, frame_h, fps):
         """Fast headless render loop for exporting a video file"""
+        params = self._snapshot_render_params()
+        params["is_webcam"] = False
+        local_warp_mode = params["warp_mode"]
+        local_placement = params["placement"]
+        local_feather = params["feather"]
+        local_coast_limit = params["coast_limit"]
+        local_codec = params.get("codec", self.codec)
+
         self._clear_canvas_cache()
         self.tracker.reset()
         self.quad_tracker.reset()
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        writer = FfmpegFrameWriter(self.export_path, frame_w, frame_h, fps, self.music_path, codec=self.codec, preset=self.preset)
+        writer = FfmpegFrameWriter(self.export_path, frame_w, frame_h, fps, self.music_path, codec=local_codec, preset=self.preset)
         
         future_tracker = None
         prev_frame = None
@@ -737,24 +856,25 @@ class VideoProcessorThread(QThread):
         def process_prev():
             nonlocal prev_frame_idx
             hand_result = future_tracker.result()
-            self.quad_tracker.coast_limit = self.coast_limit
+            self.quad_tracker.coast_limit = local_coast_limit
             smoothed = self.quad_tracker.update(hand_result.roles)
-            quad_pts = self._quad_pts_for_mode(smoothed)
+            quad_pts = self._quad_pts_for_mode(smoothed, warp_mode=local_warp_mode)
 
             active_quad_pts = self._compute_endfade_quad(
                 prev_frame_idx, quad_pts, frame_w, frame_h, frame_w, frame_h,
-                use_proxy=False, endfade_base_quad=self.endfade_base_quad,
+                use_proxy=False, endfade_base_quad=params.get("endfade_base_quad"),
+                params=params,
             )
 
             active_image_bgra = self.full_image_bgra
-            if not getattr(self, "has_custom_image", True) and self.warp_mode:
+            if not getattr(self, "has_custom_image", True) and local_warp_mode:
                 active_image_bgra = self.full_grid_bgra
 
-            if self.warp_mode:
-                out_frame = warp_composite_frame(prev_frame, active_quad_pts, active_image_bgra, feather=self.feather)
+            if local_warp_mode:
+                out_frame = warp_composite_frame(prev_frame, active_quad_pts, active_image_bgra, feather=local_feather)
             else:
-                self._ensure_canvas(active_image_bgra, self.placement, frame_w, frame_h)
-                out_frame = composite_frame(prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=self.feather)
+                self._ensure_canvas(active_image_bgra, local_placement, frame_w, frame_h, warp_mode=local_warp_mode)
+                out_frame = composite_frame(prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=local_feather)
                 
             if getattr(self, "_render_debug", False):
                 from src.debug_draw import draw_debug_overlay
@@ -820,14 +940,9 @@ class VideoProcessorThread(QThread):
         if total_frames > 0:
             self.duration_changed.emit(total_frames)
 
-        writer = FfmpegFrameWriter(TEMP_RECORDING, frame_w, frame_h, fps, self.music_path, codec=self.codec, preset=self.preset)
-        
-        future_tracker = None
-        prev_frame = None
-        prev_frame_idx = 0
-        current_frame_idx = 0
-        
         params = self._render_params_snapshot
+        fps = self._clamp_fps(params.get("fps", fps), fps)
+        local_codec = params.get("codec", self.codec)
         local_warp_mode = params.get("warp_mode", False)
         local_placement = params.get("placement", {"x": 960, "y": 540, "scale": 1.0, "rotation_deg": 0.0})
         local_feather = params.get("feather", 9)
@@ -837,7 +952,14 @@ class VideoProcessorThread(QThread):
         local_endfade_offset = params.get("endfade_offset", 0)
         local_endfade_duration_frames = params.get("endfade_duration_frames", 60)
         local_endfade_base_quad = params.get("endfade_base_quad", None)
-        
+
+        writer = FfmpegFrameWriter(TEMP_RECORDING, frame_w, frame_h, fps, self.music_path, codec=local_codec, preset=self.preset)
+
+        future_tracker = None
+        prev_frame = None
+        prev_frame_idx = 0
+        current_frame_idx = 0
+
         local_cached_canvas_bgr = None
         local_cached_canvas_alpha = None
         local_last_placement = None
@@ -894,7 +1016,8 @@ class VideoProcessorThread(QThread):
             if getattr(self, "_render_debug", False):
                 from src.debug_draw import draw_debug_overlay
                 out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
-                        
+
+            out_frame = cv2.flip(out_frame, 1)
             if not writer.write(out_frame) or writer.failed:
                 raise RuntimeError(writer.error_message or "Webcam render write failed.")
             
@@ -907,6 +1030,7 @@ class VideoProcessorThread(QThread):
                 ok, frame = cap.read()
                 
                 if ok:
+                    frame = cv2.flip(frame, 1)
                     timestamp_ms = int((current_frame_idx / fps) * 1000)
                     current_future = self._executor.submit(self.tracker.process, frame, timestamp_ms)
                 else:
@@ -1001,6 +1125,7 @@ class MainWindow(QMainWindow):
         self._image_adjust_dialog = None
         self._last_preview_pixmap = None
         self._last_frame_size = None
+        self._pending_restore_placement = None
         self._try_restore_session()
 
     def apply_clean_white_theme(self):
@@ -1245,7 +1370,58 @@ class MainWindow(QMainWindow):
             "music": self.music_path,
             "is_webcam": self._is_webcam,
             "out_dir": self.le_out_dir.text(),
+            "placement": {
+                "x": self.slider_x.value(),
+                "y": self.slider_y.value(),
+                "scale": self.slider_scale.value() / 100.0,
+                "rotation_deg": self.slider_rot.value(),
+            },
+            "warp_mode": self.cb_warp.isChecked(),
+            "endfade_mode": self.cb_endfade.isChecked(),
+            "endfade_offset": self.slider_ef_offset.value(),
+            "endfade_duration": self.slider_ef_dur.value(),
+            "feather": self.slider_feather.value(),
+            "coast_limit": self.slider_coast.value(),
+            "codec": self.cb_codec.currentText().split(" ")[0],
         })
+
+    def _apply_restored_compositing(self, settings):
+        widgets = (
+            self.cb_warp, self.cb_endfade, self.cb_codec,
+            self.slider_feather, self.slider_coast,
+            self.slider_ef_offset, self.slider_ef_dur,
+            self.slider_scale, self.slider_rot,
+        )
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            if "warp_mode" in settings:
+                self.cb_warp.setChecked(bool(settings["warp_mode"]))
+            if "endfade_mode" in settings:
+                self.cb_endfade.setChecked(bool(settings["endfade_mode"]))
+            if "feather" in settings:
+                self.slider_feather.setValue(max(0, min(31, int(settings["feather"]))))
+            if "coast_limit" in settings:
+                self.slider_coast.setValue(max(0, min(60, int(settings["coast_limit"]))))
+            if "endfade_offset" in settings:
+                self.slider_ef_offset.setValue(max(-120, min(120, int(settings["endfade_offset"]))))
+            if "endfade_duration" in settings:
+                self.slider_ef_dur.setValue(max(15, min(180, int(settings["endfade_duration"]))))
+            placement = settings.get("placement")
+            if isinstance(placement, dict):
+                scale_pct = int(round(float(placement.get("scale", 1.0)) * 100))
+                rot = int(round(float(placement.get("rotation_deg", 0.0))))
+                self.slider_scale.setValue(max(1, min(300, scale_pct)))
+                self.slider_rot.setValue(max(-180, min(180, rot)))
+            codec = settings.get("codec")
+            if codec:
+                for i in range(self.cb_codec.count()):
+                    if self.cb_codec.itemText(i).split(" ")[0] == codec:
+                        self.cb_codec.setCurrentIndex(i)
+                        break
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
 
     def _try_restore_session(self):
         last_run = load_last_run()
@@ -1275,6 +1451,10 @@ class MainWindow(QMainWindow):
         if last_run.get("music") and os.path.isfile(last_run["music"]):
             self.music_path = last_run["music"]
             self.btn_music.setText(os.path.basename(self.music_path))
+        settings = session_compositing_settings(last_run)
+        self._apply_restored_compositing(settings)
+        if "placement" in settings:
+            self._pending_restore_placement = settings["placement"]
         if self.video_path:
             self.update_controls_mode()
             self.start_playback()
@@ -1311,14 +1491,32 @@ class MainWindow(QMainWindow):
         self.slider_y.setRange(0, frame_h)
         size_changed = self._last_frame_size != (frame_w, frame_h)
         if size_changed:
-            cx, cy = frame_w // 2, frame_h // 2
+            pending = self._pending_restore_placement
+            self._pending_restore_placement = None
             self._prevent_slider_feedback = True
-            self.slider_x.setValue(cx)
-            self.slider_y.setValue(cy)
+            if pending:
+                x = int(round(max(0, min(frame_w, float(pending.get("x", frame_w / 2.0))))))
+                y = int(round(max(0, min(frame_h, float(pending.get("y", frame_h / 2.0))))))
+                scale = float(pending.get("scale", 1.0))
+                rot = float(pending.get("rotation_deg", 0.0))
+                self.slider_x.setValue(x)
+                self.slider_y.setValue(y)
+                self.slider_scale.setValue(max(1, min(300, int(round(scale * 100)))))
+                self.slider_rot.setValue(max(-180, min(180, int(round(rot)))))
+                placement = {
+                    "x": x,
+                    "y": y,
+                    "scale": self.slider_scale.value() / 100.0,
+                    "rotation_deg": float(self.slider_rot.value()),
+                }
+            else:
+                cx, cy = frame_w // 2, frame_h // 2
+                self.slider_x.setValue(cx)
+                self.slider_y.setValue(cy)
+                placement = {"x": cx, "y": cy}
             self._prevent_slider_feedback = False
-            center = {"x": cx, "y": cy}
-            self.processor.update_params({"placement": center})
-            self.video_label.update_placement(center)
+            self.processor.update_params({"placement": placement})
+            self.video_label.update_placement(placement)
             self._last_frame_size = (frame_w, frame_h)
         if self._image_adjust_dialog and self._image_adjust_dialog.isVisible():
             self._image_adjust_dialog.preview.frame_size = (frame_w, frame_h)
