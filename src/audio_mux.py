@@ -51,10 +51,17 @@ class FfmpegFrameWriter:
         )
 
     def write(self, frame_bgr):
-        self._proc.stdin.write(frame_bgr.tobytes())
+        try:
+            self._proc.stdin.write(frame_bgr.tobytes())
+        except (BrokenPipeError, OSError):
+            pass  # It will be handled in close()
 
     def close(self):
-        self._proc.stdin.close()
+        try:
+            if self._proc.stdin:
+                self._proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
         _, stderr = self._proc.communicate()
         if self._proc.returncode != 0:
             raise RuntimeError(f"ffmpeg failed:\n{stderr.decode(errors='replace')}")

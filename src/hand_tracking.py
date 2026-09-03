@@ -59,6 +59,9 @@ class HandTracker:
         self._landmarker = HandLandmarker.create_from_options(options)
         self._last_timestamp_ms = -1
 
+    def reset(self):
+        self._last_timestamp_ms = -1
+
     def process(self, frame_bgr, timestamp_ms: int) -> HandFrameResult:
         import cv2
 
@@ -71,7 +74,11 @@ class HandTracker:
             timestamp_ms = self._last_timestamp_ms + 1
         self._last_timestamp_ms = timestamp_ms
 
-        result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
+        try:
+            result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
+        except Exception as e:
+            print(f"MediaPipe tracking error: {e}")
+            return HandFrameResult()
 
         out = HandFrameResult()
         seen_labels = set()

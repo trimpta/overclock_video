@@ -60,6 +60,11 @@ def build_canvas(image_bgra, placement: dict, frame_w: int, frame_h: int):
     through even if the mask covers that area.
     """
     scale = max(placement.get("scale", 1.0), 0.01)
+    img_h, img_w = image_bgra.shape[:2]
+    
+    if int(img_w * scale) == 0 or int(img_h * scale) == 0:
+        return np.zeros((frame_h, frame_w, 3), dtype=np.uint8), np.zeros((frame_h, frame_w), dtype=np.uint8)
+        
     rotation_deg = placement.get("rotation_deg", 0.0)
     cx = placement.get("x", frame_w / 2)
     cy = placement.get("y", frame_h / 2)

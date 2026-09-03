@@ -947,7 +947,19 @@ class MainWindow(QMainWindow):
     def start_playback(self):
         if not self.video_path:
             return
+            
+        self.btn_webcam.setEnabled(False)
+        self.btn_video.setEnabled(False)
+        self.btn_image.setEnabled(False)
+        self.btn_music.setEnabled(False)
+        QApplication.processEvents()
+        
         self.processor.set_media(self.video_path, self.image_path, self.music_path, is_webcam=self._is_webcam)
+        
+        self.btn_webcam.setEnabled(True)
+        self.btn_video.setEnabled(True)
+        self.btn_image.setEnabled(True)
+        self.btn_music.setEnabled(True)
         self.on_settings_changed()
         if not self.processor.isRunning():
             self.processor.start()
