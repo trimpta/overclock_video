@@ -34,6 +34,21 @@ def make_greenscreen_bgra(frame_w: int, frame_h: int):
     return canvas
 
 
+def make_grid_bgra(frame_w: int, frame_h: int, cell_size: int = 100):
+    """A wireframe grid used as a fallback for Warp Mode."""
+    canvas = np.zeros((frame_h, frame_w, 4), dtype=np.uint8)
+    canvas[:, :, :3] = (240, 240, 240)  # Light gray background
+    canvas[:, :, 3] = 255
+
+    line_color = (150, 150, 150) # Darker gray lines
+    for x in range(0, frame_w, cell_size):
+        cv2.line(canvas, (x, 0), (x, frame_h), line_color, 2)
+    for y in range(0, frame_h, cell_size):
+        cv2.line(canvas, (0, y), (frame_w, y), line_color, 2)
+        
+    return canvas
+
+
 def full_frame_placement(frame_w: int, frame_h: int):
     return {"x": frame_w / 2, "y": frame_h / 2, "scale": 1.0, "rotation_deg": 0.0}
 
@@ -100,11 +115,15 @@ def composite_frame(frame_bgr, quad_pts, canvas_bgr, canvas_alpha, feather: int 
         k = feather | 1  # ensure odd kernel size
         mask = cv2.GaussianBlur(mask, (k, k), 0)
 
-    alpha = (mask.astype(np.float32) / 255.0) * (canvas_alpha.astype(np.float32) / 255.0)
-    alpha = alpha[:, :, None]
+    alpha_8u = cv2.multiply(mask, canvas_alpha, scale=1.0/255.0)
+    alpha_3ch = cv2.merge([alpha_8u, alpha_8u, alpha_8u])
 
-    out = frame_bgr.astype(np.float32) * (1 - alpha) + canvas_bgr.astype(np.float32) * alpha
-    return out.astype(np.uint8)
+    frame_16 = frame_bgr.astype(np.uint16)
+    canvas_16 = canvas_bgr.astype(np.uint16)
+    
+    out_16 = frame_16 * (255 - alpha_3ch) + canvas_16 * alpha_3ch
+    out = (out_16 // 255).astype(np.uint8)
+    return out
 
 
 def warp_composite_frame(frame_bgr, quad_pts, image_bgra, feather: int = 9):
@@ -142,8 +161,12 @@ def warp_composite_frame(frame_bgr, quad_pts, image_bgra, feather: int = 9):
         k = feather | 1
         mask = cv2.GaussianBlur(mask, (k, k), 0)
 
-    alpha = (mask.astype(np.float32) / 255.0) * (warped_alpha.astype(np.float32) / 255.0)
-    alpha = alpha[:, :, None]
+    alpha_8u = cv2.multiply(mask, warped_alpha, scale=1.0/255.0)
+    alpha_3ch = cv2.merge([alpha_8u, alpha_8u, alpha_8u])
 
-    out = frame_bgr.astype(np.float32) * (1 - alpha) + warped_bgr.astype(np.float32) * alpha
-    return out.astype(np.uint8)
+    frame_16 = frame_bgr.astype(np.uint16)
+    warped_16 = warped_bgr.astype(np.uint16)
+    
+    out_16 = frame_16 * (255 - alpha_3ch) + warped_16 * alpha_3ch
+    out = (out_16 // 255).astype(np.uint8)
+    return out
