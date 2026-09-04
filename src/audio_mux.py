@@ -203,6 +203,40 @@ def get_default_audio_device():
     return None
 
 
+def list_audio_input_devices():
+    """Return a list of available microphone device names."""
+    devices = []
+    try:
+        from PyQt6.QtMultimedia import QMediaDevices
+        qt_devices = QMediaDevices.audioInputs()
+        for d in qt_devices:
+            if d and not d.isNull():
+                desc = d.description()
+                if desc and desc not in devices:
+                    devices.append(desc)
+    except Exception:
+        pass
+
+    if sys.platform.startswith("win") and not devices:
+        try:
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+            proc = subprocess.run(
+                [exe, "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=5,
+            )
+            dshow_devices = re.findall(r'"([^"]+)"\s+\(audio\)', proc.stderr)
+            for d in dshow_devices:
+                if d not in devices:
+                    devices.append(d)
+        except Exception:
+            pass
+
+    return devices
+
+
 class FfmpegAudioRecorder:
     """Records microphone audio to a file in the background using ffmpeg."""
 

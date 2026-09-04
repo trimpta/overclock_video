@@ -142,6 +142,8 @@ def session_compositing_settings(data):
         out["endfade_mode"] = bool(data["endfade_mode"])
     if "record_mic" in data:
         out["record_mic"] = bool(data["record_mic"])
+    if "mic_device" in data and isinstance(data["mic_device"], str):
+        out["mic_device"] = data["mic_device"].strip()
     for key, caster in (
         ("endfade_offset", int),
         ("endfade_duration", int),

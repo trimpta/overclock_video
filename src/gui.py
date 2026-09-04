@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QFormLayout, QComboBox, QMessageBox, QStyle, QProgressBar, QLineEdit, QDialog,
 )
 
-from src.audio_mux import FfmpegFrameWriter, FfmpegAudioRecorder, get_default_audio_device
+from src.audio_mux import FfmpegFrameWriter, FfmpegAudioRecorder, get_default_audio_device, list_audio_input_devices
 from src.config import (
     MEDIA_DIR,
     OUTPUT_DIR,
@@ -203,6 +203,7 @@ class VideoProcessorThread(QThread):
         self._rendering_webcam = False
         self._last_frame_emit_time = None
         self.record_mic = True
+        self.mic_device = None
         self._mic_recorder = None
 
     def _set_flag(self, name, value):
@@ -234,7 +235,7 @@ class VideoProcessorThread(QThread):
         self._set_flag('_recording', True)
         if self.is_webcam and not self.music_path and self.record_mic:
             try:
-                self._mic_recorder = FfmpegAudioRecorder(RAW_TEMP_MIC_AUDIO)
+                self._mic_recorder = FfmpegAudioRecorder(RAW_TEMP_MIC_AUDIO, device_name=self.mic_device)
                 self._mic_recorder.start()
             except Exception as e:
                 print(f"Warning: Failed to start microphone recording: {e}")
@@ -255,6 +256,7 @@ class VideoProcessorThread(QThread):
 
     def update_params(self, params):
         if "record_mic" in params: self.record_mic = bool(params["record_mic"])
+        if "mic_device" in params: self.mic_device = params["mic_device"]
         if "warp_mode" in params: self.warp_mode = params["warp_mode"]
         if "feather" in params: self.feather = params["feather"]
         if "coast_limit" in params: self.coast_limit = params["coast_limit"]
@@ -338,6 +340,7 @@ class VideoProcessorThread(QThread):
             "codec": self.codec,
             "render_debug": self.render_debug,
             "record_mic": self.record_mic,
+            "mic_device": self.mic_device,
             "is_webcam": self.is_webcam,
         }
         if fps is not None:
@@ -1282,6 +1285,13 @@ class MainWindow(QMainWindow):
         self.cb_record_mic.stateChanged.connect(self.on_settings_changed)
         media_layout.addRow("Mic:", self.cb_record_mic)
 
+        self.cb_mic_device = QComboBox()
+        self.cb_mic_device.setToolTip("Select microphone input device.")
+        self.populate_mic_devices()
+        self.cb_mic_device.currentIndexChanged.connect(self.on_settings_changed)
+        self.cb_record_mic.toggled.connect(self.cb_mic_device.setEnabled)
+        media_layout.addRow("Device:", self.cb_mic_device)
+
         left_panel.addWidget(media_group)
 
         comp_group = QGroupBox("Compositing")
@@ -1466,6 +1476,18 @@ class MainWindow(QMainWindow):
         
         self._prevent_slider_feedback = False
 
+    def populate_mic_devices(self):
+        self.cb_mic_device.blockSignals(True)
+        self.cb_mic_device.clear()
+        self.cb_mic_device.addItem("Default Microphone", None)
+        try:
+            devices = list_audio_input_devices()
+            for dev in devices:
+                self.cb_mic_device.addItem(dev, dev)
+        except Exception as e:
+            print(f"Warning: Failed to enumerate audio devices: {e}")
+        self.cb_mic_device.blockSignals(False)
+
     def _save_session(self):
         save_last_run({
             "video": self.video_path,
@@ -1473,6 +1495,7 @@ class MainWindow(QMainWindow):
             "music": self.music_path,
             "is_webcam": self._is_webcam,
             "record_mic": self.cb_record_mic.isChecked(),
+            "mic_device": self.cb_mic_device.currentData(),
             "out_file": resolve_output_file(self.le_out_dir.text()),
             "placement": {
                 "x": self.slider_x.value(),
@@ -1491,7 +1514,7 @@ class MainWindow(QMainWindow):
 
     def _apply_restored_compositing(self, settings):
         widgets = (
-            self.cb_warp, self.cb_endfade, self.cb_record_mic, self.cb_codec,
+            self.cb_warp, self.cb_endfade, self.cb_record_mic, self.cb_mic_device, self.cb_codec,
             self.slider_feather, self.slider_coast,
             self.slider_ef_offset, self.slider_ef_dur,
             self.slider_scale, self.slider_rot,
@@ -1501,6 +1524,11 @@ class MainWindow(QMainWindow):
         try:
             if "record_mic" in settings:
                 self.cb_record_mic.setChecked(bool(settings["record_mic"]))
+            if "mic_device" in settings and settings["mic_device"]:
+                target_dev = settings["mic_device"]
+                idx = self.cb_mic_device.findData(target_dev)
+                if idx >= 0:
+                    self.cb_mic_device.setCurrentIndex(idx)
             if "warp_mode" in settings:
                 self.cb_warp.setChecked(bool(settings["warp_mode"]))
             if "endfade_mode" in settings:
@@ -1734,6 +1762,7 @@ class MainWindow(QMainWindow):
             
         params = {
             "record_mic": self.cb_record_mic.isChecked(),
+            "mic_device": self.cb_mic_device.currentData(),
             "warp_mode": self.cb_warp.isChecked(),
             "feather": self.slider_feather.value(),
             "coast_limit": self.slider_coast.value(),
