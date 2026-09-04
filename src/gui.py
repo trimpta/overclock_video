@@ -161,6 +161,8 @@ class VideoProcessorThread(QThread):
         self.placement = {"x": 960, "y": 540, "scale": 1.0, "rotation_deg": 0.0}
         self.feather = 9
         self.coast_limit = 15
+        self.interpolate_enabled = True
+        self.adaptive_smoothing = True
         self.show_debug = False
         self.render_debug = False
 
@@ -269,6 +271,8 @@ class VideoProcessorThread(QThread):
         if "warp_mode" in params: self.warp_mode = params["warp_mode"]
         if "feather" in params: self.feather = params["feather"]
         if "coast_limit" in params: self.coast_limit = params["coast_limit"]
+        if "interpolate_enabled" in params: self.interpolate_enabled = bool(params["interpolate_enabled"])
+        if "adaptive_smoothing" in params: self.adaptive_smoothing = bool(params["adaptive_smoothing"])
         if "show_debug" in params: self.show_debug = params["show_debug"]
         if "render_debug" in params: self.render_debug = bool(params["render_debug"])
         if "placement" in params:
@@ -359,6 +363,8 @@ class VideoProcessorThread(QThread):
             "placement": self.placement.copy(),
             "feather": self.feather,
             "coast_limit": self.coast_limit,
+            "interpolate_enabled": self.interpolate_enabled,
+            "adaptive_smoothing": self.adaptive_smoothing,
             "endfade_mode": self.endfade_mode,
             "endfade_offset": self.endfade_offset,
             "endfade_duration_frames": self.endfade_duration_frames,
@@ -529,7 +535,11 @@ class VideoProcessorThread(QThread):
             self.has_custom_image = False
 
         self.tracker = HandTracker(MODEL_PATH, num_hands=2)
-        self.quad_tracker = QuadTracker(coast_limit=self.coast_limit)
+        self.quad_tracker = QuadTracker(
+            coast_limit=self.coast_limit,
+            interpolate_enabled=self.interpolate_enabled,
+            adaptive_smoothing=self.adaptive_smoothing,
+        )
         self._gui_frame_pending = False
         self._clear_canvas_cache()
         self._live_quad_ordered_proxy = None
@@ -871,6 +881,8 @@ class VideoProcessorThread(QThread):
                             hand_result = future_tracker.result()
 
                             self.quad_tracker.coast_limit = self.coast_limit
+                            self.quad_tracker.interpolate_enabled = self.interpolate_enabled
+                            self.quad_tracker.adaptive_smoothing = self.adaptive_smoothing
                             smoothed = self.quad_tracker.update(hand_result.roles)
                             quad_pts = self._quad_pts_for_mode(smoothed)
 
@@ -953,6 +965,8 @@ class VideoProcessorThread(QThread):
         local_placement = params["placement"]
         local_feather = params["feather"]
         local_coast_limit = params["coast_limit"]
+        local_interpolate_enabled = params.get("interpolate_enabled", True)
+        local_adaptive_smoothing = params.get("adaptive_smoothing", True)
         local_render_debug = params.get("render_debug", self.render_debug)
         local_codec = params.get("codec", self.codec)
 
@@ -978,6 +992,8 @@ class VideoProcessorThread(QThread):
             nonlocal prev_frame_idx
             hand_result = future_tracker.result()
             self.quad_tracker.coast_limit = local_coast_limit
+            self.quad_tracker.interpolate_enabled = local_interpolate_enabled
+            self.quad_tracker.adaptive_smoothing = local_adaptive_smoothing
             smoothed = self.quad_tracker.update(hand_result.roles)
             quad_pts = self._quad_pts_for_mode(smoothed, warp_mode=local_warp_mode)
 
@@ -1090,6 +1106,8 @@ class VideoProcessorThread(QThread):
         local_placement = params.get("placement", {"x": 960, "y": 540, "scale": 1.0, "rotation_deg": 0.0})
         local_feather = params.get("feather", 9)
         local_coast_limit = params.get("coast_limit", 15)
+        local_interpolate_enabled = params.get("interpolate_enabled", True)
+        local_adaptive_smoothing = params.get("adaptive_smoothing", True)
         local_endfade_mode = params.get("endfade_mode", False)
         local_endfade_trigger_frame = params.get("endfade_trigger_frame", None)
         local_endfade_offset = params.get("endfade_offset", 0)
@@ -1147,6 +1165,8 @@ class VideoProcessorThread(QThread):
             nonlocal prev_frame_idx
             hand_result = future_tracker.result()
             self.quad_tracker.coast_limit = local_coast_limit
+            self.quad_tracker.interpolate_enabled = local_interpolate_enabled
+            self.quad_tracker.adaptive_smoothing = local_adaptive_smoothing
             smoothed = self.quad_tracker.update(hand_result.roles)
             quad_pts = self._quad_pts_for_mode(smoothed, warp_mode=local_warp_mode)
 
@@ -1372,6 +1392,26 @@ class MainWindow(QMainWindow):
         self.slider_feather.valueChanged.connect(self.on_settings_changed)
         comp_layout.addRow("Feather:", self.slider_feather)
 
+        self.cb_adaptive_smooth = QCheckBox("Adaptive Motion Smoothing")
+        self.cb_adaptive_smooth.setToolTip(
+            "Automatically smooths harder when hand-tracking confidence drops or your\n"
+            "hands move very fast, to reduce jitter. When off, a fixed baseline amount\n"
+            "of smoothing is always applied instead."
+        )
+        self.cb_adaptive_smooth.setChecked(True)
+        self.cb_adaptive_smooth.stateChanged.connect(self.on_settings_changed)
+        comp_layout.addRow(self.cb_adaptive_smooth)
+
+        self.cb_interpolate = QCheckBox("Interpolate Through Tracking Loss")
+        self.cb_interpolate.setToolTip(
+            "When tracking is briefly lost, predict the hand's motion for up to Coast\n"
+            "Limit frames before hiding the image. Disable to hide the image the instant\n"
+            "tracking is lost, ignoring Coast Limit."
+        )
+        self.cb_interpolate.setChecked(True)
+        self.cb_interpolate.stateChanged.connect(self.on_settings_changed)
+        comp_layout.addRow(self.cb_interpolate)
+
         self.slider_coast = QSlider(Qt.Orientation.Horizontal)
         self.slider_coast.setToolTip("How many frames the image persists after tracking is lost.\nUseful to cover up brief moments where MediaPipe fails to see your hands.")
         self.slider_coast.setRange(0, 60)
@@ -1573,12 +1613,15 @@ class MainWindow(QMainWindow):
             "endfade_duration": self.slider_ef_dur.value(),
             "feather": self.slider_feather.value(),
             "coast_limit": self.slider_coast.value(),
+            "interpolate_enabled": self.cb_interpolate.isChecked(),
+            "adaptive_smoothing": self.cb_adaptive_smooth.isChecked(),
             "codec": self.cb_codec.currentText().split(" ")[0],
         })
 
     def _apply_restored_compositing(self, settings):
         widgets = (
             self.cb_warp, self.cb_endfade, self.cb_record_mic, self.cb_mic_device, self.cb_codec,
+            self.cb_adaptive_smooth, self.cb_interpolate,
             self.slider_feather, self.slider_coast,
             self.slider_ef_offset, self.slider_ef_dur,
             self.slider_scale, self.slider_rot,
@@ -1601,6 +1644,10 @@ class MainWindow(QMainWindow):
                 self.slider_feather.setValue(max(0, min(31, int(settings["feather"]))))
             if "coast_limit" in settings:
                 self.slider_coast.setValue(max(0, min(60, int(settings["coast_limit"]))))
+            if "interpolate_enabled" in settings:
+                self.cb_interpolate.setChecked(bool(settings["interpolate_enabled"]))
+            if "adaptive_smoothing" in settings:
+                self.cb_adaptive_smooth.setChecked(bool(settings["adaptive_smoothing"]))
             if "endfade_offset" in settings:
                 self.slider_ef_offset.setValue(max(-120, min(120, int(settings["endfade_offset"]))))
             if "endfade_duration" in settings:
@@ -1829,6 +1876,8 @@ class MainWindow(QMainWindow):
             "warp_mode": self.cb_warp.isChecked(),
             "feather": self.slider_feather.value(),
             "coast_limit": self.slider_coast.value(),
+            "interpolate_enabled": self.cb_interpolate.isChecked(),
+            "adaptive_smoothing": self.cb_adaptive_smooth.isChecked(),
             "show_debug": self.cb_debug.isChecked(),
             "render_debug": self.cb_render_debug.isChecked(),
             "endfade_mode": is_endfade,
