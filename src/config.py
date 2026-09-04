@@ -56,14 +56,21 @@ def resolve_write_path(path: str) -> str:
 def resolve_output_file(path: str, default_name: str = "output.mp4") -> str:
     """Absolute export file path; relative names are under the project, never the repo root."""
     ensure_app_dirs()
+    if not default_name.lower().endswith(".mp4"):
+        default_name += ".mp4"
     path = (path or "").strip().strip('"')
     if not path:
         return resolve_write_path(os.path.join(OUTPUT_DIR, default_name))
     if not os.path.isabs(path):
         path = os.path.join(PROJECT_ROOT, path)
     path = os.path.normpath(path)
+    if os.path.isdir(path):
+        return resolve_write_path(os.path.join(path, default_name))
     parent = resolve_output_dir(os.path.dirname(path) or OUTPUT_DIR)
-    return resolve_write_path(os.path.join(parent, os.path.basename(path)))
+    base = os.path.basename(path)
+    if not base.lower().endswith(".mp4"):
+        base += ".mp4"
+    return resolve_write_path(os.path.join(parent, base))
 
 
 def load_placement(path: str):

@@ -20,6 +20,7 @@ from src.audio_mux import FfmpegFrameWriter, FfmpegAudioRecorder, get_default_au
 from src.config import (
     MEDIA_DIR,
     OUTPUT_DIR,
+    PROJECT_ROOT,
     USER_DATA_DIR,
     ensure_app_dirs,
     load_last_run,
@@ -1814,7 +1815,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.hide()
         
         if os.path.exists(TEMP_RECORDING):
-            default_out = os.path.join(PROJECT_ROOT, "output", "webcam_recording.mp4")
+            default_out = resolve_output_file(os.path.join(OUTPUT_DIR, "webcam_recording.mp4"))
             save_path, _ = QFileDialog.getSaveFileName(
                 self,
                 "Save Recorded Video",
@@ -1822,6 +1823,7 @@ class MainWindow(QMainWindow):
                 "Video Files (*.mp4);;All Files (*.*)",
             )
             if save_path:
+                save_path = resolve_output_file(save_path)
                 try:
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
                     shutil.copy2(TEMP_RECORDING, save_path)
