@@ -133,6 +133,8 @@ def session_compositing_settings(data):
         out["warp_mode"] = bool(data["warp_mode"])
     if "endfade_mode" in data:
         out["endfade_mode"] = bool(data["endfade_mode"])
+    if "record_mic" in data:
+        out["record_mic"] = bool(data["record_mic"])
     for key, caster in (
         ("endfade_offset", int),
         ("endfade_duration", int),
