@@ -3,9 +3,10 @@ in the music track, looping/trimming it to exactly match the video length.
 """
 import subprocess
 import threading
-
 import imageio_ffmpeg
 import numpy as np
+
+from src.config import resolve_write_path
 
 
 def _codec_args(codec: str, preset: str):
@@ -36,6 +37,7 @@ class FfmpegFrameWriter:
         height &= ~1
         self.width = max(2, width)
         self.height = max(2, height)
+        output_path = resolve_write_path(output_path)
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         cmd = [
             ffmpeg_exe, "-y",

@@ -17,15 +17,24 @@ from PyQt6.QtWidgets import (
 )
 
 from src.audio_mux import FfmpegFrameWriter
-from src.config import load_last_run, save_last_run, session_compositing_settings
+from src.config import (
+    MEDIA_DIR,
+    OUTPUT_DIR,
+    USER_DATA_DIR,
+    ensure_app_dirs,
+    load_last_run,
+    resolve_existing_path,
+    resolve_output_dir,
+    resolve_output_file,
+    save_last_run,
+    session_compositing_settings,
+)
 from src.compositor import build_canvas, composite_frame, warp_composite_frame, load_image_bgra, make_greenscreen_bgra, make_grid_bgra, full_frame_placement
 from src.hand_tracking import HandTracker
 from src.smoothing import QuadTracker, order_points_tl_tr_br_bl
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "hand_landmarker.task")
-PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-USER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data")
-os.makedirs(USER_DATA_DIR, exist_ok=True)
+ensure_app_dirs()
 TEMP_RECORDING = os.path.join(USER_DATA_DIR, "temp_recording.mp4")
 RAW_TEMP_RECORDING = os.path.join(USER_DATA_DIR, "raw_temp.mp4")
 
@@ -1360,11 +1369,11 @@ class MainWindow(QMainWindow):
         export_opt_layout = QVBoxLayout(self.export_options_group)
         
         dir_layout = QHBoxLayout()
-        default_out_dir = os.path.join(PROJECT_ROOT, "output")
-        self.le_out_dir = QLineEdit(default_out_dir)
+        default_out_file = os.path.join(OUTPUT_DIR, "output.mp4")
+        self.le_out_dir = QLineEdit(default_out_file)
         self.btn_out_dir = QPushButton("Browse...")
         self.btn_out_dir.clicked.connect(self.select_out_dir)
-        dir_layout.addWidget(QLabel("Output Dir:"))
+        dir_layout.addWidget(QLabel("Output File:"))
         dir_layout.addWidget(self.le_out_dir)
         dir_layout.addWidget(self.btn_out_dir)
         export_opt_layout.addLayout(dir_layout)
@@ -1401,7 +1410,7 @@ class MainWindow(QMainWindow):
             "image": self.image_path,
             "music": self.music_path,
             "is_webcam": self._is_webcam,
-            "out_dir": self.le_out_dir.text(),
+            "out_file": resolve_output_file(self.le_out_dir.text()),
             "placement": {
                 "x": self.slider_x.value(),
                 "y": self.slider_y.value(),
@@ -1466,8 +1475,10 @@ class MainWindow(QMainWindow):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        if last_run.get("out_dir"):
-            self.le_out_dir.setText(last_run["out_dir"])
+        if last_run.get("out_file"):
+            self.le_out_dir.setText(resolve_output_file(last_run["out_file"]))
+        elif last_run.get("out_dir"):
+            self.le_out_dir.setText(resolve_output_file(os.path.join(resolve_output_dir(last_run["out_dir"]), "output.mp4")))
         if last_run.get("is_webcam") or str(last_run.get("video")) in ("0", 0):
             self._is_webcam = True
             self.video_path = "0"
@@ -1565,7 +1576,7 @@ class MainWindow(QMainWindow):
         self._save_session()
 
     def select_video(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Video Files (*.mp4 *.mov *.avi *.mkv *.webm)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select Video", MEDIA_DIR, "Video Files (*.mp4 *.mov *.avi *.mkv *.webm)")
         if path:
             self._is_webcam = False
             self.video_path = path
@@ -1576,7 +1587,7 @@ class MainWindow(QMainWindow):
             self._save_session()
 
     def select_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select Image", MEDIA_DIR, "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)")
         if path:
             self.image_path = path
             self.btn_image.setText(os.path.basename(path))
@@ -1584,7 +1595,7 @@ class MainWindow(QMainWindow):
             self._save_session()
 
     def select_music(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Music", "", "Audio Files (*.mp3 *.wav *.m4a *.flac *.aac)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select Music", MEDIA_DIR, "Audio Files (*.mp3 *.wav *.m4a *.flac *.aac)")
         if path:
             self.music_path = path
             self.btn_music.setText(os.path.basename(path))
@@ -1731,26 +1742,19 @@ class MainWindow(QMainWindow):
         self.progress_bar.hide()
 
     def select_out_dir(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "Select Output Directory", self.le_out_dir.text())
-        if dir_path:
-            self.le_out_dir.setText(dir_path)
+        current_path = self.le_out_dir.text() or os.path.join(OUTPUT_DIR, "output.mp4")
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Select Output File",
+            current_path,
+            "Video Files (*.mp4);;All Files (*.*)",
+        )
+        if file_path:
+            self.le_out_dir.setText(resolve_output_file(file_path))
 
     def do_export(self):
-        out_dir = self.le_out_dir.text()
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except Exception as e:
-            QMessageBox.critical(self, "Directory Error", f"Could not create output directory:\n{e}")
-            return
-            
-        base_name = "output"
-        ext = ".mp4"
-        out_path = os.path.join(out_dir, f"{base_name}{ext}")
-        
-        idx = 1
-        while os.path.exists(out_path):
-            out_path = os.path.join(out_dir, f"{base_name}_{idx:03d}{ext}")
-            idx += 1
+        out_path = resolve_output_file(self.le_out_dir.text())
+        self.le_out_dir.setText(out_path)
             
         self.processor.update_params({"render_debug": self.cb_render_debug.isChecked()})
         
