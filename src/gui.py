@@ -1740,6 +1740,22 @@ class MainWindow(QMainWindow):
         self.btn_record.setStyleSheet("background-color: #f0f0f0; color: black; font-weight: bold;")
         self.btn_export.setEnabled(True)
         self.progress_bar.hide()
+        
+        if os.path.exists(TEMP_RECORDING):
+            default_out = os.path.join(PROJECT_ROOT, "output", "webcam_recording.mp4")
+            save_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Recorded Video",
+                default_out,
+                "Video Files (*.mp4);;All Files (*.*)",
+            )
+            if save_path:
+                try:
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    shutil.copy2(TEMP_RECORDING, save_path)
+                    QMessageBox.information(self, "Recording Saved", f"Saved recording to:\n{save_path}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Save Error", f"Failed to save recording:\n{e}")
 
     def select_out_dir(self):
         current_path = self.le_out_dir.text() or os.path.join(OUTPUT_DIR, "output.mp4")
