@@ -199,6 +199,7 @@ class VideoProcessorThread(QThread):
         self._raw_writer = None
         self._render_params_snapshot = None
         self._rendering_webcam = False
+        self._last_frame_emit_time = None
 
     def _set_flag(self, name, value):
         with self._lock:
@@ -268,9 +269,11 @@ class VideoProcessorThread(QThread):
         self._set_flag('_needs_restart', True)
 
     def request_seek(self, frame_idx):
+        self._last_frame_emit_time = None
         self._set_flag('_seek_request', frame_idx)
         
     def set_paused(self, paused):
+        self._last_frame_emit_time = None
         self._set_flag('_paused', paused)
 
     def _quad_pts_for_mode(self, smoothed, warp_mode=None):
@@ -393,6 +396,7 @@ class VideoProcessorThread(QThread):
 
     def _begin_session(self):
         """Open video source, load media, create tracker. Returns session tuple or None."""
+        self._last_frame_emit_time = None
         if self.video_path is None:
             self.error_occurred.emit("No video source selected.")
             return None
@@ -529,7 +533,16 @@ class VideoProcessorThread(QThread):
             self._gui_frame_pending = True
             self.frame_ready.emit(qimg)
         if not force and not self.is_webcam:
-            time.sleep(1.0 / max(fps, 1.0))
+            target_interval = 1.0 / max(fps, 1.0)
+            now = time.perf_counter()
+            if self._last_frame_emit_time is not None:
+                elapsed = now - self._last_frame_emit_time
+                remaining = target_interval - elapsed
+                if remaining > 0.001:
+                    time.sleep(remaining)
+            self._last_frame_emit_time = time.perf_counter()
+        else:
+            self._last_frame_emit_time = None
 
     def run(self):
         self._set_flag('_running', True)
