@@ -408,7 +408,14 @@ class VideoProcessorThread(QThread):
         self._reset_endfade_state()
 
         if self.is_webcam:
-            self.cap = cv2.VideoCapture(int(self.video_path) if str(self.video_path).isdigit() else 0)
+            cam_idx = int(self.video_path) if str(self.video_path).isdigit() else 0
+            if sys.platform.startswith("win"):
+                self.cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
+                if not self.cap.isOpened():
+                    self.cap.release()
+                    self.cap = cv2.VideoCapture(cam_idx)
+            else:
+                self.cap = cv2.VideoCapture(cam_idx)
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         else:
