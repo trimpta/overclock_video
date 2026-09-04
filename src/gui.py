@@ -1544,7 +1544,14 @@ class MainWindow(QMainWindow):
 
     def _on_image_editor_closed(self):
         if self._image_adjust_dialog:
-            self._image_adjust_dialog.preview.placement_changed.disconnect(self.on_interactive_placement)
+            try:
+                self._image_adjust_dialog.preview.placement_changed.disconnect(self.on_interactive_placement)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self._image_adjust_dialog.finished.disconnect(self._on_image_editor_closed)
+            except (TypeError, RuntimeError):
+                pass
             self._image_adjust_dialog = None
 
     @pyqtSlot(int, int)
