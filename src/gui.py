@@ -148,7 +148,7 @@ class VideoProcessorThread(QThread):
         self.warp_mode = False
         self.placement = {"x": 960, "y": 540, "scale": 1.0, "rotation_deg": 0.0}
         self.feather = 9
-        self.coast_limit = 0
+        self.coast_limit = 15
         self.show_debug = False
 
         self._running = False
@@ -941,7 +941,7 @@ class VideoProcessorThread(QThread):
         local_warp_mode = params.get("warp_mode", False)
         local_placement = params.get("placement", {"x": 960, "y": 540, "scale": 1.0, "rotation_deg": 0.0})
         local_feather = params.get("feather", 9)
-        local_coast_limit = params.get("coast_limit", 0)
+        local_coast_limit = params.get("coast_limit", 15)
         local_endfade_mode = params.get("endfade_mode", False)
         local_endfade_trigger_frame = params.get("endfade_trigger_frame", None)
         local_endfade_offset = params.get("endfade_offset", 0)
@@ -1204,7 +1204,7 @@ class MainWindow(QMainWindow):
         self.slider_coast = QSlider(Qt.Orientation.Horizontal)
         self.slider_coast.setToolTip("How many frames the image persists after tracking is lost.\nUseful to cover up brief moments where MediaPipe fails to see your hands.")
         self.slider_coast.setRange(0, 60)
-        self.slider_coast.setValue(0)
+        self.slider_coast.setValue(15)
         self.slider_coast.valueChanged.connect(self.on_settings_changed)
         comp_layout.addRow("Coast Limit:", self.slider_coast)
 
