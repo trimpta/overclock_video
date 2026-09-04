@@ -654,13 +654,8 @@ class VideoProcessorThread(QThread):
                                 continue
                             else:
                                 future_tracker = self._drain_future(future_tracker)
-                                if self.endfade_mode and self.endfade_trigger_frame is not None:
-                                    loop_start = max(0, self.endfade_trigger_frame + self.endfade_offset - int(fps))
-                                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, loop_start)
-                                    preview_frame_idx = loop_start
-                                else:
-                                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                                    preview_frame_idx = 0
+                                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                preview_frame_idx = 0
                                 prev_frame = None
                                 proxy_prev_frame = None
                                 self.quad_tracker.reset()
