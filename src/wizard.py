@@ -5,6 +5,13 @@ possible.
 import glob
 import os
 
+from .config import MEDIA_DIR, OUTPUT_DIR, USER_DATA_DIR, ensure_app_dirs
+
+
+def _default_search_dirs():
+    ensure_app_dirs()
+    return (MEDIA_DIR, USER_DATA_DIR, OUTPUT_DIR)
+
 VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv")
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp")
 AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".wma")
@@ -25,7 +32,9 @@ def menu_choice(prompt: str, options: list):
         print("Invalid choice, try again.")
 
 
-def _find_files(exts, search_dirs=(".",)):
+def _find_files(exts, search_dirs=None):
+    if search_dirs is None:
+        search_dirs = _default_search_dirs()
     found = []
     for d in search_dirs:
         for ext in exts:
@@ -42,7 +51,7 @@ def _find_files(exts, search_dirs=(".",)):
     return unique
 
 
-def ask_file_path(kind_label: str, exts: tuple, search_dirs=(".",), allow_webcam: bool = False, allow_none: bool = False, none_label: str = None):
+def ask_file_path(kind_label: str, exts: tuple, search_dirs=None, allow_webcam: bool = False, allow_none: bool = False, none_label: str = None):
     candidates = _find_files(exts, search_dirs)
     options = []
     if allow_webcam:

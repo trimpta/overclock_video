@@ -1,7 +1,69 @@
 import json
 import os
 
-DEFAULT_LAST_RUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data", ".last_run.json")
+PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
+USER_DATA_DIR = os.path.join(PROJECT_ROOT, "userdata")
+MEDIA_DIR = os.path.join(USER_DATA_DIR, "media")
+DEFAULT_LAST_RUN_PATH = os.path.join(USER_DATA_DIR, ".last_run.json")
+
+
+def ensure_app_dirs():
+    for path in (MEDIA_DIR, OUTPUT_DIR, USER_DATA_DIR):
+        os.makedirs(path, exist_ok=True)
+
+
+def resolve_existing_path(path):
+    """Turn a stored path into an existing file, preferring media/ over project root."""
+    if path is None or path == "":
+        return None
+    if str(path) in ("0", "webcam") or (isinstance(path, int)):
+        return str(path)
+    path = os.path.expanduser(str(path).strip().strip('"'))
+    if os.path.isfile(path):
+        return os.path.normpath(os.path.abspath(path))
+    name = os.path.basename(path)
+    for folder in (MEDIA_DIR, USER_DATA_DIR, OUTPUT_DIR, PROJECT_ROOT):
+        candidate = os.path.join(folder, name)
+        if os.path.isfile(candidate):
+            return os.path.normpath(candidate)
+    return None
+
+
+def resolve_output_dir(path: str) -> str:
+    """Exports never land in the project root; relative paths are under PROJECT_ROOT."""
+    ensure_app_dirs()
+    path = (path or "").strip().strip('"')
+    if not path:
+        return OUTPUT_DIR
+    if not os.path.isabs(path):
+        path = os.path.join(PROJECT_ROOT, path)
+    path = os.path.normpath(path)
+    if os.path.normcase(path) == os.path.normcase(PROJECT_ROOT):
+        return OUTPUT_DIR
+    return path
+
+
+def resolve_write_path(path: str) -> str:
+    """Absolute path for ffmpeg/temp writes; create the parent directory."""
+    path = os.path.normpath(os.path.abspath(path))
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return path
+
+
+def resolve_output_file(path: str, default_name: str = "output.mp4") -> str:
+    """Absolute export file path; relative names are under the project, never the repo root."""
+    ensure_app_dirs()
+    path = (path or "").strip().strip('"')
+    if not path:
+        return resolve_write_path(os.path.join(OUTPUT_DIR, default_name))
+    if not os.path.isabs(path):
+        path = os.path.join(PROJECT_ROOT, path)
+    path = os.path.normpath(path)
+    parent = resolve_output_dir(os.path.dirname(path) or OUTPUT_DIR)
+    return resolve_write_path(os.path.join(parent, os.path.basename(path)))
 
 
 def load_placement(path: str):
@@ -12,6 +74,7 @@ def load_placement(path: str):
 
 
 def save_placement(path: str, placement: dict):
+    path = resolve_write_path(path)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(placement, f, indent=2)
 
@@ -23,12 +86,19 @@ def load_last_run(path: str = DEFAULT_LAST_RUN_PATH):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         video = data.get("video")
-        if video and video not in ("0", 0) and not str(video).isdigit() and not os.path.isfile(video):
-            return None
-        if data.get("image") and not os.path.isfile(data["image"]):
-            data["image"] = None
-        if data.get("music") and not os.path.isfile(data["music"]):
-            data["music"] = None
+        if video and str(video) not in ("0", "webcam") and not str(video).isdigit():
+            resolved = resolve_existing_path(video)
+            if not resolved:
+                return None
+            data["video"] = resolved
+        if data.get("image"):
+            data["image"] = resolve_existing_path(data["image"])
+        if data.get("music"):
+            data["music"] = resolve_existing_path(data["music"])
+        if data.get("out_file"):
+            data["out_file"] = resolve_output_file(data["out_file"])
+        elif data.get("out_dir"):
+            data["out_file"] = resolve_output_file(os.path.join(resolve_output_dir(data["out_dir"]), "output.mp4"))
         return data
     except Exception:
         return None
