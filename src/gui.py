@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QFormLayout, QComboBox, QMessageBox, QStyle, QProgressBar, QLineEdit, QDialog,
 )
 
-from src.audio_mux import FfmpegFrameWriter
+from src.audio_mux import FfmpegFrameWriter, FfmpegAudioRecorder, get_default_audio_device
 from src.config import (
     MEDIA_DIR,
     OUTPUT_DIR,
@@ -37,6 +37,7 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mod
 ensure_app_dirs()
 TEMP_RECORDING = os.path.join(USER_DATA_DIR, "temp_recording.mp4")
 RAW_TEMP_RECORDING = os.path.join(USER_DATA_DIR, "raw_temp.mp4")
+RAW_TEMP_MIC_AUDIO = os.path.join(USER_DATA_DIR, "raw_mic.wav")
 
 
 class PreviewLabel(QLabel):
@@ -200,6 +201,8 @@ class VideoProcessorThread(QThread):
         self._render_params_snapshot = None
         self._rendering_webcam = False
         self._last_frame_emit_time = None
+        self.record_mic = True
+        self._mic_recorder = None
 
     def _set_flag(self, name, value):
         with self._lock:
@@ -228,15 +231,29 @@ class VideoProcessorThread(QThread):
 
     def start_recording(self):
         self._set_flag('_recording', True)
+        if self.is_webcam and not self.music_path and self.record_mic:
+            try:
+                self._mic_recorder = FfmpegAudioRecorder(RAW_TEMP_MIC_AUDIO)
+                self._mic_recorder.start()
+            except Exception as e:
+                print(f"Warning: Failed to start microphone recording: {e}")
+                self._mic_recorder = None
 
     def stop_recording(self):
         self._set_flag('_recording', False)
+        if self._mic_recorder is not None:
+            try:
+                self._mic_recorder.stop()
+            except Exception:
+                pass
+            self._mic_recorder = None
         
     def start_export(self, export_path):
         self.export_path = export_path
         self._set_flag('_exporting', True)
 
     def update_params(self, params):
+        if "record_mic" in params: self.record_mic = bool(params["record_mic"])
         if "warp_mode" in params: self.warp_mode = params["warp_mode"]
         if "feather" in params: self.feather = params["feather"]
         if "coast_limit" in params: self.coast_limit = params["coast_limit"]
@@ -319,6 +336,7 @@ class VideoProcessorThread(QThread):
             "endfade_trigger_frame": self.endfade_trigger_frame,
             "codec": self.codec,
             "render_debug": self.render_debug,
+            "record_mic": self.record_mic,
             "is_webcam": self.is_webcam,
         }
         if fps is not None:
@@ -328,6 +346,12 @@ class VideoProcessorThread(QThread):
     def _abort_raw_writer(self, message=None):
         if message:
             self.error_occurred.emit(message)
+        if self._mic_recorder is not None:
+            try:
+                self._mic_recorder.terminate()
+            except Exception:
+                pass
+            self._mic_recorder = None
         if self._raw_writer is not None:
             try:
                 self._raw_writer.terminate()
@@ -368,6 +392,12 @@ class VideoProcessorThread(QThread):
 
     def _end_session(self):
         """Release capture/tracker for the current source without stopping the thread."""
+        if getattr(self, '_mic_recorder', None) is not None:
+            try:
+                self._mic_recorder.terminate()
+            except Exception:
+                pass
+            self._mic_recorder = None
         if getattr(self, '_raw_writer', None):
             try:
                 self._raw_writer.terminate()
@@ -1010,8 +1040,13 @@ class VideoProcessorThread(QThread):
         local_endfade_duration_frames = params.get("endfade_duration_frames", 60)
         local_endfade_base_quad = params.get("endfade_base_quad", None)
         local_render_debug = params.get("render_debug", self.render_debug)
+        local_record_mic = params.get("record_mic", self.record_mic)
 
-        writer = FfmpegFrameWriter(TEMP_RECORDING, frame_w, frame_h, fps, self.music_path, codec=local_codec, preset=self.preset)
+        active_audio = self.music_path
+        if not active_audio and local_record_mic and os.path.isfile(RAW_TEMP_MIC_AUDIO) and os.path.getsize(RAW_TEMP_MIC_AUDIO) > 100:
+            active_audio = RAW_TEMP_MIC_AUDIO
+
+        writer = FfmpegFrameWriter(TEMP_RECORDING, frame_w, frame_h, fps, active_audio, codec=local_codec, preset=self.preset)
 
         future_tracker = None
         prev_frame = None
@@ -1240,6 +1275,12 @@ class MainWindow(QMainWindow):
         self.btn_music.clicked.connect(self.select_music)
         media_layout.addRow("Music:", self.btn_music)
 
+        self.cb_record_mic = QCheckBox("Record Mic (when no music)")
+        self.cb_record_mic.setToolTip("When recording with webcam, captures microphone audio if no music track is selected.")
+        self.cb_record_mic.setChecked(True)
+        self.cb_record_mic.stateChanged.connect(self.on_settings_changed)
+        media_layout.addRow("Mic:", self.cb_record_mic)
+
         left_panel.addWidget(media_group)
 
         comp_group = QGroupBox("Compositing")
@@ -1430,6 +1471,7 @@ class MainWindow(QMainWindow):
             "image": self.image_path,
             "music": self.music_path,
             "is_webcam": self._is_webcam,
+            "record_mic": self.cb_record_mic.isChecked(),
             "out_file": resolve_output_file(self.le_out_dir.text()),
             "placement": {
                 "x": self.slider_x.value(),
@@ -1448,7 +1490,7 @@ class MainWindow(QMainWindow):
 
     def _apply_restored_compositing(self, settings):
         widgets = (
-            self.cb_warp, self.cb_endfade, self.cb_codec,
+            self.cb_warp, self.cb_endfade, self.cb_record_mic, self.cb_codec,
             self.slider_feather, self.slider_coast,
             self.slider_ef_offset, self.slider_ef_dur,
             self.slider_scale, self.slider_rot,
@@ -1456,6 +1498,8 @@ class MainWindow(QMainWindow):
         for w in widgets:
             w.blockSignals(True)
         try:
+            if "record_mic" in settings:
+                self.cb_record_mic.setChecked(bool(settings["record_mic"]))
             if "warp_mode" in settings:
                 self.cb_warp.setChecked(bool(settings["warp_mode"]))
             if "endfade_mode" in settings:
@@ -1688,6 +1732,7 @@ class MainWindow(QMainWindow):
             self.endfade_group.hide()
             
         params = {
+            "record_mic": self.cb_record_mic.isChecked(),
             "warp_mode": self.cb_warp.isChecked(),
             "feather": self.slider_feather.value(),
             "coast_limit": self.slider_coast.value(),

@@ -1,7 +1,10 @@
 """Streams raw BGR frames into ffmpeg (bundled via imageio-ffmpeg) and muxes
 in the music track, looping/trimming it to exactly match the video length.
 """
+import os
+import re
 import subprocess
+import sys
 import threading
 import imageio_ffmpeg
 import numpy as np
@@ -165,3 +168,129 @@ class FfmpegFrameWriter:
             self._stderr_thread.join(timeout=1)
         self._closed = True
         self.failed = True
+
+
+def get_default_audio_device():
+    """Detect default microphone device for audio capture."""
+    if sys.platform.startswith("win"):
+        try:
+            from PyQt6.QtMultimedia import QMediaDevices
+            dev = QMediaDevices.defaultAudioInput()
+            if dev and not dev.isNull():
+                desc = dev.description()
+                if desc:
+                    return desc
+        except Exception:
+            pass
+        try:
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+            proc = subprocess.run(
+                [exe, "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=5,
+            )
+            devices = re.findall(r'"([^"]+)"\s+\(audio\)', proc.stderr)
+            if devices:
+                return devices[0]
+        except Exception:
+            pass
+    elif sys.platform.startswith("darwin"):
+        return ":default"
+    else:
+        return "default"
+    return None
+
+
+class FfmpegAudioRecorder:
+    """Records microphone audio to a file in the background using ffmpeg."""
+
+    def __init__(self, output_path: str, device_name: str = None):
+        self.output_path = resolve_write_path(output_path)
+        self.device_name = device_name or get_default_audio_device()
+        self._proc = None
+        self._closed = False
+        self.failed = False
+        self.error_message = None
+
+    def start(self):
+        if not self.device_name:
+            self.failed = True
+            self.error_message = "No audio input device detected."
+            return False
+
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.output_path)), exist_ok=True)
+            if os.path.isfile(self.output_path):
+                try:
+                    os.remove(self.output_path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if sys.platform.startswith("win"):
+            input_args = ["-f", "dshow", "-i", f"audio={self.device_name}"]
+        elif sys.platform.startswith("darwin"):
+            input_args = ["-f", "avfoundation", "-i", str(self.device_name)]
+        else:
+            input_args = ["-f", "pulse" if "pulse" in str(self.device_name) else "alsa", "-i", str(self.device_name)]
+
+        cmd = [
+            ffmpeg_exe, "-y",
+            "-loglevel", "error",
+            *input_args,
+            "-ac", "2",
+            "-ar", "44100",
+            self.output_path,
+        ]
+
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            return True
+        except Exception as e:
+            self.failed = True
+            self.error_message = f"Failed to start audio recorder: {e}"
+            return False
+
+    def stop(self):
+        if self._proc is None or self._closed:
+            return
+        self._closed = True
+        try:
+            if self._proc.stdin and not self._proc.stdin.closed:
+                self._proc.stdin.write(b"q")
+                self._proc.stdin.flush()
+                self._proc.stdin.close()
+        except Exception:
+            pass
+
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.terminate()
+
+    def terminate(self):
+        if self._proc is None:
+            return
+        try:
+            if self._proc.stdin and not self._proc.stdin.closed:
+                self._proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self._proc.kill()
+        except Exception:
+            pass
+        try:
+            self._proc.wait(timeout=3)
+        except Exception:
+            pass
+        self._closed = True
