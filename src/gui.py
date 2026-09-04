@@ -144,6 +144,7 @@ class VideoProcessorThread(QThread):
     endfade_scan_progress = pyqtSignal(int, int)
     endfade_scan_complete = pyqtSignal(int, np.ndarray)
     endfade_scan_failed = pyqtSignal(str)
+    endfade_trigger_failed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -176,6 +177,14 @@ class VideoProcessorThread(QThread):
         self.endfade_base_quad_proxy = None
         self.endfade_duration_frames = 60
         self.endfade_offset = 0
+        # Continuously-updated last live-tracked quad (TL/TR/BR/BL, proxy space) so a
+        # manually-set endfade trigger starts from where the hands actually were.
+        self._live_quad_ordered_proxy = None
+        self._live_quad_frame_idx = None
+        self.frame_w = None
+        self.frame_h = None
+        self.proxy_w = None
+        self.proxy_h = None
 
         self._recording = False
         self._exporting = False
@@ -266,12 +275,31 @@ class VideoProcessorThread(QThread):
             self.placement.update(params["placement"])
         if "codec" in params: self.codec = params["codec"]
         if "endfade_mode" in params:
-            new_mode = params["endfade_mode"]
-            if new_mode and not self.endfade_mode and not self.is_webcam:
-                self._set_flag('_scanning_endfade', True)
-            self.endfade_mode = new_mode
+            self.endfade_mode = params["endfade_mode"]
         if "endfade_offset" in params: self.endfade_offset = params["endfade_offset"]
         if "endfade_duration" in params: self.endfade_duration_frames = params["endfade_duration"]
+
+    def request_endfade_scan(self):
+        """Auto-detect the trigger frame by scanning for the last frame hands are visible."""
+        if self.is_webcam:
+            return
+        self._set_flag('_scanning_endfade', True)
+
+    def set_endfade_trigger_here(self):
+        """Set the endfade trigger to the currently-displayed frame, using the
+        actual live-tracked hand quad so the fade starts with no visual jump."""
+        if self.is_webcam:
+            return
+        if self._live_quad_ordered_proxy is None or self._live_quad_frame_idx is None:
+            self.endfade_trigger_failed.emit("No hand position tracked yet — let the video play a bit, then try again.")
+            return
+        base_quad_proxy = self._live_quad_ordered_proxy.copy()
+        self.endfade_trigger_frame = self._live_quad_frame_idx
+        self.endfade_base_quad_proxy = base_quad_proxy
+        scale_x = self.frame_w / self.proxy_w
+        scale_y = self.frame_h / self.proxy_h
+        self.endfade_base_quad = np.round(base_quad_proxy * [scale_x, scale_y]).astype(np.int32)
+        self.endfade_scan_complete.emit(self.endfade_trigger_frame, self.endfade_base_quad)
 
     def set_gui_size(self, w, h):
         self.target_gui_size = (w, h)
@@ -485,6 +513,8 @@ class VideoProcessorThread(QThread):
 
         proxy_w = max(2, int(frame_w * self.proxy_scale))
         proxy_h = max(2, int(frame_h * self.proxy_scale))
+        self.frame_w, self.frame_h = frame_w, frame_h
+        self.proxy_w, self.proxy_h = proxy_w, proxy_h
 
         self.full_grid_bgra = make_grid_bgra(frame_w, frame_h)
         self.grid_bgra = make_grid_bgra(proxy_w, proxy_h)
@@ -502,9 +532,8 @@ class VideoProcessorThread(QThread):
         self.quad_tracker = QuadTracker(coast_limit=self.coast_limit)
         self._gui_frame_pending = False
         self._clear_canvas_cache()
-        # Keep endfade_mode (UI checkbox); rescan the new clip if still enabled.
-        if self.endfade_mode and not self.is_webcam:
-            self._set_flag('_scanning_endfade', True)
+        self._live_quad_ordered_proxy = None
+        self._live_quad_frame_idx = None
         return fps, frame_w, frame_h, total_frames, proxy_w, proxy_h
 
     def _ensure_canvas(self, active_image_bgra, placement, cache_w, cache_h, proxy_scale=1.0, warp_mode=None):
@@ -553,7 +582,7 @@ class VideoProcessorThread(QThread):
             return active_quad_pts
         return active_quad_pts
 
-    def _emit_gui_frame(self, out_frame, fps, force=False):
+    def _emit_gui_frame(self, out_frame, fps, force=False, status_label=None):
         ow, oh = out_frame.shape[1], out_frame.shape[0]
         gw, gh = self.target_gui_size
         if gw > 0 and gh > 0:
@@ -563,7 +592,9 @@ class VideoProcessorThread(QThread):
         else:
             gui_frame = out_frame
         gui_frame = cv2.cvtColor(gui_frame, cv2.COLOR_BGR2RGB)
-        if self.is_webcam:
+        if status_label:
+            cv2.putText(gui_frame, status_label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 2, cv2.LINE_AA)
+        elif self.is_webcam:
             dbg = "ON" if self.show_debug else "OFF"
             cv2.putText(gui_frame, f"LIVE (WEBCAM) | Debug: {dbg}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 2, cv2.LINE_AA)
         if force or not self._gui_frame_pending:
@@ -604,6 +635,7 @@ class VideoProcessorThread(QThread):
                 future_tracker = None
                 prev_frame = None
                 proxy_prev_frame = None
+                last_ok_frame = None
                 prev_frame_idx = 0
                 preview_frame_idx = 0
                 webcam_frame_idx = 0
@@ -646,6 +678,7 @@ class VideoProcessorThread(QThread):
                             self._set_flag('_seek_request', None)
                             prev_frame = None
                             proxy_prev_frame = None
+                            last_ok_frame = None
                             preview_frame_idx = seek_req
                             self.quad_tracker.reset()
                             self.tracker.reset()
@@ -714,19 +747,32 @@ class VideoProcessorThread(QThread):
                             continue
 
                         ok, frame = self.cap.read()
+                        if ok:
+                            last_ok_frame = frame
                         if not ok:
                             if self.is_webcam:
                                 time.sleep(0.01)
                                 continue
                             else:
-                                future_tracker = self._drain_future(future_tracker)
-                                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                                preview_frame_idx = 0
-                                prev_frame = None
-                                proxy_prev_frame = None
-                                self.quad_tracker.reset()
-                                self.tracker.reset()
-                                continue
+                                # If the endfade transition hasn't finished animating yet,
+                                # keep re-feeding the last frame instead of cutting the fade
+                                # short and looping back to the start (#endfade-eof).
+                                fade_end = None
+                                if self.endfade_mode and self.endfade_trigger_frame is not None:
+                                    fade_end = self.endfade_trigger_frame + self.endfade_offset + self.endfade_duration_frames
+                                if fade_end is not None and last_ok_frame is not None and preview_frame_idx < fade_end:
+                                    ok = True
+                                    frame = last_ok_frame
+                                else:
+                                    future_tracker = self._drain_future(future_tracker)
+                                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                    preview_frame_idx = 0
+                                    prev_frame = None
+                                    proxy_prev_frame = None
+                                    last_ok_frame = None
+                                    self.quad_tracker.reset()
+                                    self.tracker.reset()
+                                    continue
 
                         if self.is_webcam:
                             # Track unflipped; mirror only for display/record (#46).
@@ -827,6 +873,12 @@ class VideoProcessorThread(QThread):
                             self.quad_tracker.coast_limit = self.coast_limit
                             smoothed = self.quad_tracker.update(hand_result.roles)
                             quad_pts = self._quad_pts_for_mode(smoothed)
+
+                            if not self.is_webcam:
+                                ordered = QuadTracker.ordered_quad_points(smoothed)
+                                if ordered is not None:
+                                    self._live_quad_ordered_proxy = np.round(ordered).astype(np.int32)
+                                    self._live_quad_frame_idx = prev_frame_idx
 
                             active_quad_pts = self._compute_endfade_quad(
                                 prev_frame_idx, quad_pts, frame_w, frame_h, proxy_w, proxy_h,
@@ -1115,9 +1167,10 @@ class VideoProcessorThread(QThread):
                 out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
 
             out_frame = cv2.flip(out_frame, 1)
+            self._emit_gui_frame(out_frame, fps, status_label="RENDERING...")
             if not writer.write(out_frame) or writer.failed:
                 raise RuntimeError(writer.error_message or "Webcam render write failed.")
-            
+
             if prev_frame_idx % 10 == 0:
                 self.position_changed.emit(prev_frame_idx)
         
@@ -1216,6 +1269,7 @@ class MainWindow(QMainWindow):
         self.processor.endfade_scan_progress.connect(self.on_endfade_progress)
         self.processor.endfade_scan_complete.connect(self.on_endfade_complete)
         self.processor.endfade_scan_failed.connect(self.on_endfade_scan_failed)
+        self.processor.endfade_trigger_failed.connect(self.on_endfade_trigger_failed)
         self.processor.resolution_changed.connect(self.on_resolution_changed)
         
         self.init_ui()
@@ -1330,7 +1384,17 @@ class MainWindow(QMainWindow):
         self.endfade_group = QGroupBox("Endfade Editor")
         endfade_layout = QFormLayout(self.endfade_group)
         self.endfade_group.hide()
-        
+
+        self.btn_ef_set_here = QPushButton("Set Trigger at Current Frame")
+        self.btn_ef_set_here.setToolTip("Pause/seek to the frame where the fade should begin, then click this\nto set the trigger there using your hands' current tracked position.")
+        self.btn_ef_set_here.clicked.connect(self.on_set_endfade_trigger_here)
+        endfade_layout.addRow(self.btn_ef_set_here)
+
+        self.btn_ef_autodetect = QPushButton("Auto-Detect Trigger")
+        self.btn_ef_autodetect.setToolTip("Scan the clip for the last frame your hands are visible and use that as the trigger.")
+        self.btn_ef_autodetect.clicked.connect(self.on_autodetect_endfade_trigger)
+        endfade_layout.addRow(self.btn_ef_autodetect)
+
         self.slider_ef_offset = QSlider(Qt.Orientation.Horizontal)
         self.slider_ef_offset.setRange(-120, 120)
         self.slider_ef_offset.setValue(0)
@@ -1754,8 +1818,7 @@ class MainWindow(QMainWindow):
         codec_str = self.cb_codec.currentText().split(" ")[0]
         
         is_endfade = self.cb_endfade.isChecked()
-        if is_endfade and not self._is_webcam and not self.processor.endfade_mode:
-            self.lbl_ef_status.setText("Scanning video...")
+        if is_endfade and not self._is_webcam:
             self.endfade_group.show()
         elif not is_endfade:
             self.endfade_group.hide()
@@ -1781,11 +1844,18 @@ class MainWindow(QMainWindow):
         }
         self.processor.update_params(params)
         
+    def on_set_endfade_trigger_here(self):
+        self.processor.set_endfade_trigger_here()
+
+    def on_autodetect_endfade_trigger(self):
+        self.lbl_ef_status.setText("Scanning video...")
+        self.processor.request_endfade_scan()
+
     @pyqtSlot(int, int)
     def on_endfade_progress(self, current, total):
         pct = int((current / total) * 100) if total > 0 else 0
         self.lbl_ef_status.setText(f"Scanning... {pct}%")
-        
+
     @pyqtSlot(int, np.ndarray)
     def on_endfade_complete(self, trigger_frame, last_quad):
         self.lbl_ef_status.setText(f"Trigger: Frame {trigger_frame}")
@@ -1798,6 +1868,10 @@ class MainWindow(QMainWindow):
         self.endfade_group.hide()
         self.lbl_ef_status.setText("Scan failed")
         QMessageBox.critical(self, "Error", msg)
+
+    @pyqtSlot(str)
+    def on_endfade_trigger_failed(self, msg):
+        self.lbl_ef_status.setText(msg)
 
     def on_interactive_placement(self, placement):
         self._prevent_slider_feedback = True
