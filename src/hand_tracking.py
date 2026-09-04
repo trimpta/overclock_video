@@ -48,19 +48,34 @@ class HandTracker:
         min_hand_presence_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
     ):
+        self._model_path = model_path
+        self._num_hands = num_hands
+        self._min_hand_detection_confidence = min_hand_detection_confidence
+        self._min_hand_presence_confidence = min_hand_presence_confidence
+        self._min_tracking_confidence = min_tracking_confidence
+        self._landmarker = None
+        self._last_timestamp_ms = -1
+        self._create_landmarker()
+
+    def _create_landmarker(self):
         options = HandLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=model_path),
+            base_options=BaseOptions(model_asset_path=self._model_path),
             running_mode=RunningMode.VIDEO,
-            num_hands=num_hands,
-            min_hand_detection_confidence=min_hand_detection_confidence,
-            min_hand_presence_confidence=min_hand_presence_confidence,
-            min_tracking_confidence=min_tracking_confidence,
+            num_hands=self._num_hands,
+            min_hand_detection_confidence=self._min_hand_detection_confidence,
+            min_hand_presence_confidence=self._min_hand_presence_confidence,
+            min_tracking_confidence=self._min_tracking_confidence,
         )
         self._landmarker = HandLandmarker.create_from_options(options)
         self._last_timestamp_ms = -1
 
     def reset(self):
-        self._last_timestamp_ms = -1
+        """Drop MediaPipe VIDEO temporal state. Timestamp-only reset is not enough —
+        detect_for_video keeps an internal tracker, so a later seek to frame 0
+        (export after preview/endfade scan) misses hands for a long stretch.
+        """
+        self.close()
+        self._create_landmarker()
 
     def process(self, frame_bgr, timestamp_ms: int) -> HandFrameResult:
         import cv2
@@ -112,4 +127,11 @@ class HandTracker:
         return out
 
     def close(self):
-        self._landmarker.close()
+        if self._landmarker is None:
+            return
+        try:
+            self._landmarker.close()
+        except Exception:
+            pass
+        self._landmarker = None
+        self._last_timestamp_ms = -1
