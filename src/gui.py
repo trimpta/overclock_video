@@ -846,7 +846,14 @@ class VideoProcessorThread(QThread):
         self.tracker.reset()
         self.quad_tracker.reset()
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        writer = FfmpegFrameWriter(self.export_path, frame_w, frame_h, fps, self.music_path, codec=local_codec, preset=self.preset)
+        temp_export_path = os.path.join(USER_DATA_DIR, "temp_export.mp4")
+        if os.path.exists(temp_export_path):
+            try:
+                os.remove(temp_export_path)
+            except Exception:
+                pass
+
+        writer = FfmpegFrameWriter(temp_export_path, frame_w, frame_h, fps, self.music_path, codec=local_codec, preset=self.preset)
         
         future_tracker = None
         prev_frame = None
@@ -886,6 +893,7 @@ class VideoProcessorThread(QThread):
             if prev_frame_idx % 10 == 0:
                 self.position_changed.emit(prev_frame_idx)
         
+        export_success = False
         try:
             while self._get_flag('_exporting') and self._get_flag('_running'):
                 ok, frame = self.cap.read()
@@ -910,12 +918,31 @@ class VideoProcessorThread(QThread):
 
             if prev_frame is not None and future_tracker is not None:
                 process_prev()
+            export_success = True
                     
         finally:
             try:
                 writer.close()
             except Exception as e:
+                export_success = False
                 raise RuntimeError(f"Failed to finalize export: {e}") from e
+            finally:
+                if export_success and not writer.failed:
+                    dest_dir = os.path.dirname(self.export_path)
+                    if dest_dir:
+                        os.makedirs(dest_dir, exist_ok=True)
+                    if os.path.exists(self.export_path):
+                        try:
+                            os.remove(self.export_path)
+                        except Exception:
+                            pass
+                    shutil.move(temp_export_path, self.export_path)
+                else:
+                    if os.path.exists(temp_export_path):
+                        try:
+                            os.remove(temp_export_path)
+                        except Exception:
+                            pass
             self._clear_canvas_cache()
 
     def _run_webcam_render_loop(self, frame_w, frame_h, fps):
