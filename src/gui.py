@@ -148,8 +148,9 @@ class VideoProcessorThread(QThread):
         self.warp_mode = False
         self.placement = {"x": 960, "y": 540, "scale": 1.0, "rotation_deg": 0.0}
         self.feather = 9
-        self.coast_limit = 0
+        self.coast_limit = 15
         self.show_debug = False
+        self.render_debug = False
 
         self._running = False
         self._paused = False
@@ -230,6 +231,7 @@ class VideoProcessorThread(QThread):
         if "feather" in params: self.feather = params["feather"]
         if "coast_limit" in params: self.coast_limit = params["coast_limit"]
         if "show_debug" in params: self.show_debug = params["show_debug"]
+        if "render_debug" in params: self.render_debug = bool(params["render_debug"])
         if "placement" in params:
             self.placement.update(params["placement"])
         if "codec" in params: self.codec = params["codec"]
@@ -304,6 +306,7 @@ class VideoProcessorThread(QThread):
             "endfade_base_quad_proxy": self.endfade_base_quad_proxy.copy() if self.endfade_base_quad_proxy is not None else None,
             "endfade_trigger_frame": self.endfade_trigger_frame,
             "codec": self.codec,
+            "render_debug": self.render_debug,
             "is_webcam": self.is_webcam,
         }
         if fps is not None:
@@ -654,13 +657,8 @@ class VideoProcessorThread(QThread):
                                 continue
                             else:
                                 future_tracker = self._drain_future(future_tracker)
-                                if self.endfade_mode and self.endfade_trigger_frame is not None:
-                                    loop_start = max(0, self.endfade_trigger_frame + self.endfade_offset - int(fps))
-                                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, loop_start)
-                                    preview_frame_idx = loop_start
-                                else:
-                                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                                    preview_frame_idx = 0
+                                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                preview_frame_idx = 0
                                 prev_frame = None
                                 proxy_prev_frame = None
                                 self.quad_tracker.reset()
@@ -840,6 +838,7 @@ class VideoProcessorThread(QThread):
         local_placement = params["placement"]
         local_feather = params["feather"]
         local_coast_limit = params["coast_limit"]
+        local_render_debug = params.get("render_debug", self.render_debug)
         local_codec = params.get("codec", self.codec)
 
         self._clear_canvas_cache()
@@ -883,7 +882,7 @@ class VideoProcessorThread(QThread):
                 self._ensure_canvas(active_image_bgra, local_placement, frame_w, frame_h, warp_mode=local_warp_mode)
                 out_frame = composite_frame(prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=local_feather)
                 
-            if getattr(self, "_render_debug", False):
+            if local_render_debug:
                 from src.debug_draw import draw_debug_overlay
                 out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
                 
@@ -928,6 +927,8 @@ class VideoProcessorThread(QThread):
                 raise RuntimeError(f"Failed to finalize export: {e}") from e
             finally:
                 if export_success and not writer.failed:
+                    self.duration_changed.emit(current_frame_idx)
+                    self.position_changed.emit(current_frame_idx)
                     dest_dir = os.path.dirname(self.export_path)
                     if dest_dir:
                         os.makedirs(dest_dir, exist_ok=True)
@@ -973,12 +974,13 @@ class VideoProcessorThread(QThread):
         local_warp_mode = params.get("warp_mode", False)
         local_placement = params.get("placement", {"x": 960, "y": 540, "scale": 1.0, "rotation_deg": 0.0})
         local_feather = params.get("feather", 9)
-        local_coast_limit = params.get("coast_limit", 0)
+        local_coast_limit = params.get("coast_limit", 15)
         local_endfade_mode = params.get("endfade_mode", False)
         local_endfade_trigger_frame = params.get("endfade_trigger_frame", None)
         local_endfade_offset = params.get("endfade_offset", 0)
         local_endfade_duration_frames = params.get("endfade_duration_frames", 60)
         local_endfade_base_quad = params.get("endfade_base_quad", None)
+        local_render_debug = params.get("render_debug", self.render_debug)
 
         writer = FfmpegFrameWriter(TEMP_RECORDING, frame_w, frame_h, fps, self.music_path, codec=local_codec, preset=self.preset)
 
@@ -1040,7 +1042,7 @@ class VideoProcessorThread(QThread):
                 ensure_local_canvas(active_image_bgra)
                 out_frame = composite_frame(prev_frame, active_quad_pts, local_cached_canvas_bgr, local_cached_canvas_alpha, feather=local_feather)
                         
-            if getattr(self, "_render_debug", False):
+            if local_render_debug:
                 from src.debug_draw import draw_debug_overlay
                 out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
 
@@ -1087,6 +1089,8 @@ class VideoProcessorThread(QThread):
                 self.error_occurred.emit(f"Failed to finalize webcam render: {e}")
             cap.release()
             if success:
+                self.duration_changed.emit(current_frame_idx)
+                self.position_changed.emit(current_frame_idx)
                 try:
                     os.remove(raw_path)
                 except Exception:
@@ -1236,7 +1240,7 @@ class MainWindow(QMainWindow):
         self.slider_coast = QSlider(Qt.Orientation.Horizontal)
         self.slider_coast.setToolTip("How many frames the image persists after tracking is lost.\nUseful to cover up brief moments where MediaPipe fails to see your hands.")
         self.slider_coast.setRange(0, 60)
-        self.slider_coast.setValue(0)
+        self.slider_coast.setValue(15)
         self.slider_coast.valueChanged.connect(self.on_settings_changed)
         comp_layout.addRow("Coast Limit:", self.slider_coast)
 
@@ -1367,6 +1371,7 @@ class MainWindow(QMainWindow):
         
         self.cb_render_debug = QCheckBox("Render Debug Overlays")
         self.cb_render_debug.setToolTip("Renders the skeletal tracking and quad corners into the final exported video.")
+        self.cb_render_debug.stateChanged.connect(self.on_settings_changed)
         export_opt_layout.addWidget(self.cb_render_debug)
         
         # Unified Export button
@@ -1649,6 +1654,7 @@ class MainWindow(QMainWindow):
             "feather": self.slider_feather.value(),
             "coast_limit": self.slider_coast.value(),
             "show_debug": self.cb_debug.isChecked(),
+            "render_debug": self.cb_render_debug.isChecked(),
             "endfade_mode": is_endfade,
             "endfade_offset": self.slider_ef_offset.value(),
             "endfade_duration": self.slider_ef_dur.value(),
@@ -1746,7 +1752,7 @@ class MainWindow(QMainWindow):
             out_path = os.path.join(out_dir, f"{base_name}_{idx:03d}{ext}")
             idx += 1
             
-        self.processor._render_debug = self.cb_render_debug.isChecked()
+        self.processor.update_params({"render_debug": self.cb_render_debug.isChecked()})
         
         if self._is_webcam:
             # We already recorded to TEMP_RECORDING, just copy it
@@ -1779,8 +1785,9 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(int)
     def update_timeline_range(self, total_frames):
-        self.timeline.setRange(0, total_frames)
-        self.progress_bar.setRange(0, total_frames)
+        max_idx = max(0, total_frames - 1) if total_frames > 0 else 0
+        self.timeline.setRange(0, max_idx)
+        self.progress_bar.setRange(0, max(1, total_frames))
 
     @pyqtSlot(int)
     def update_timeline_pos(self, frame_idx):

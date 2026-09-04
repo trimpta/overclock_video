@@ -9,7 +9,7 @@ from .hand_tracking import ROLE_KEYS
 
 # How many consecutive frames a point may be "coasted" (predicted with no
 # fresh measurement) before we give up and treat it as lost for that frame.
-DEFAULT_COAST_LIMIT = 0  # Hide mask immediately when tracking is lost
+DEFAULT_COAST_LIMIT = 15  # Coast brief dropouts with Kalman prediction before dropping quad
 
 
 class PointSmoother:
