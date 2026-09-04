@@ -11,10 +11,21 @@ from .hand_tracking import ROLE_KEYS
 # fresh measurement) before we give up and treat it as lost for that frame.
 DEFAULT_COAST_LIMIT = 15  # Coast brief dropouts with Kalman prediction before dropping quad
 
+# Adaptive smoothing: below this hand-detection confidence, or above this
+# raw pixel-per-frame speed, trust the Kalman prediction more than the raw
+# measurement (heavier smoothing) since the measurement is more likely to
+# be jittery/noisy under either condition.
+LOW_CONFIDENCE_THRESHOLD = 0.75
+FAST_MOTION_PX_PER_FRAME = 40.0
+BASE_MEASUREMENT_NOISE = 1e-1
+BOOSTED_MEASUREMENT_NOISE = 1.5
+
 
 class PointSmoother:
-    def __init__(self, coast_limit: int = DEFAULT_COAST_LIMIT):
+    def __init__(self, coast_limit: int = DEFAULT_COAST_LIMIT, interpolate_enabled: bool = True, adaptive_smoothing: bool = True):
         self.coast_limit = coast_limit
+        self.interpolate_enabled = interpolate_enabled
+        self.adaptive_smoothing = adaptive_smoothing
         self._kf = cv2.KalmanFilter(4, 2)
         self._kf.transitionMatrix = np.array(
             [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32
@@ -23,22 +34,28 @@ class PointSmoother:
             [[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32
         )
         self._kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
-        self._kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
+        self._kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * BASE_MEASUREMENT_NOISE
         self._initialized = False
         self.missed_frames = 0
+        self._last_raw_xy = None
 
-    def update(self, measurement_xy):
+    def update(self, measurement_xy, confidence: float = 1.0):
         """measurement_xy: (x, y) or None if not detected this frame.
 
         Returns (x, y, was_predicted, is_lost).
         """
+        # interpolate_enabled off => coast for 0 frames: hide the instant
+        # tracking is lost, regardless of the configured coast_limit.
+        effective_coast_limit = self.coast_limit if self.interpolate_enabled else 0
+
         if measurement_xy is None:
             if not self._initialized:
                 return None, None, False, True
 
             self.missed_frames += 1
-            if self.missed_frames > self.coast_limit:
+            if self.missed_frames > effective_coast_limit:
                 self._initialized = False
+                self._last_raw_xy = None
                 return None, None, False, True
 
             pred = self._kf.predict()
@@ -49,7 +66,19 @@ class PointSmoother:
             self._kf.statePost = np.array([[x], [y], [0], [0]], dtype=np.float32)
             self._initialized = True
             self.missed_frames = 0
+            self._last_raw_xy = (x, y)
             return float(x), float(y), False, False
+
+        speed = 0.0
+        if self._last_raw_xy is not None:
+            speed = float(np.hypot(x - self._last_raw_xy[0], y - self._last_raw_xy[1]))
+        self._last_raw_xy = (x, y)
+
+        if self.adaptive_smoothing and (confidence < LOW_CONFIDENCE_THRESHOLD or speed > FAST_MOTION_PX_PER_FRAME):
+            noise = BOOSTED_MEASUREMENT_NOISE
+        else:
+            noise = BASE_MEASUREMENT_NOISE
+        self._kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * noise
 
         self._kf.predict()
         corrected = self._kf.correct(np.array([[x], [y]], dtype=np.float32))
@@ -98,9 +127,13 @@ def order_points_tl_tr_br_bl(pts: np.ndarray) -> np.ndarray:
 class QuadTracker:
     """Tracks the 4 fingertip roles and produces a smoothed quad each frame."""
 
-    def __init__(self, coast_limit: int = DEFAULT_COAST_LIMIT):
+    def __init__(self, coast_limit: int = DEFAULT_COAST_LIMIT, interpolate_enabled: bool = True, adaptive_smoothing: bool = True):
         self._coast_limit = coast_limit
-        self._smoothers = {role: PointSmoother(coast_limit) for role in ROLE_KEYS}
+        self._interpolate_enabled = interpolate_enabled
+        self._adaptive_smoothing = adaptive_smoothing
+        self._smoothers = {
+            role: PointSmoother(coast_limit, interpolate_enabled, adaptive_smoothing) for role in ROLE_KEYS
+        }
 
     @property
     def coast_limit(self):
@@ -112,8 +145,31 @@ class QuadTracker:
         for smoother in self._smoothers.values():
             smoother.coast_limit = value
 
+    @property
+    def interpolate_enabled(self):
+        return self._interpolate_enabled
+
+    @interpolate_enabled.setter
+    def interpolate_enabled(self, value):
+        self._interpolate_enabled = value
+        for smoother in self._smoothers.values():
+            smoother.interpolate_enabled = value
+
+    @property
+    def adaptive_smoothing(self):
+        return self._adaptive_smoothing
+
+    @adaptive_smoothing.setter
+    def adaptive_smoothing(self, value):
+        self._adaptive_smoothing = value
+        for smoother in self._smoothers.values():
+            smoother.adaptive_smoothing = value
+
     def reset(self):
-        self._smoothers = {role: PointSmoother(self._coast_limit) for role in ROLE_KEYS}
+        self._smoothers = {
+            role: PointSmoother(self._coast_limit, self._interpolate_enabled, self._adaptive_smoothing)
+            for role in ROLE_KEYS
+        }
 
     def update(self, roles: dict):
         """roles: dict role -> (x, y, score) or None.
@@ -124,7 +180,8 @@ class QuadTracker:
         for role in ROLE_KEYS:
             measurement = roles.get(role)
             xy = (measurement[0], measurement[1]) if measurement else None
-            x, y, predicted, lost = self._smoothers[role].update(xy)
+            confidence = measurement[2] if measurement else 1.0
+            x, y, predicted, lost = self._smoothers[role].update(xy, confidence)
             out[role] = {
                 "pos": None if lost else (x, y),
                 "predicted": predicted,

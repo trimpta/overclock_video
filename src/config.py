@@ -140,6 +140,10 @@ def session_compositing_settings(data):
         out["warp_mode"] = bool(data["warp_mode"])
     if "endfade_mode" in data:
         out["endfade_mode"] = bool(data["endfade_mode"])
+    if "interpolate_enabled" in data:
+        out["interpolate_enabled"] = bool(data["interpolate_enabled"])
+    if "adaptive_smoothing" in data:
+        out["adaptive_smoothing"] = bool(data["adaptive_smoothing"])
     if "record_mic" in data:
         out["record_mic"] = bool(data["record_mic"])
     if "mic_device" in data and isinstance(data["mic_device"], str):
