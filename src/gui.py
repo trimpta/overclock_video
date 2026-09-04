@@ -150,6 +150,7 @@ class VideoProcessorThread(QThread):
         self.feather = 9
         self.coast_limit = 0
         self.show_debug = False
+        self.render_debug = False
 
         self._running = False
         self._paused = False
@@ -230,6 +231,7 @@ class VideoProcessorThread(QThread):
         if "feather" in params: self.feather = params["feather"]
         if "coast_limit" in params: self.coast_limit = params["coast_limit"]
         if "show_debug" in params: self.show_debug = params["show_debug"]
+        if "render_debug" in params: self.render_debug = bool(params["render_debug"])
         if "placement" in params:
             self.placement.update(params["placement"])
         if "codec" in params: self.codec = params["codec"]
@@ -304,6 +306,7 @@ class VideoProcessorThread(QThread):
             "endfade_base_quad_proxy": self.endfade_base_quad_proxy.copy() if self.endfade_base_quad_proxy is not None else None,
             "endfade_trigger_frame": self.endfade_trigger_frame,
             "codec": self.codec,
+            "render_debug": self.render_debug,
             "is_webcam": self.is_webcam,
         }
         if fps is not None:
@@ -840,6 +843,7 @@ class VideoProcessorThread(QThread):
         local_placement = params["placement"]
         local_feather = params["feather"]
         local_coast_limit = params["coast_limit"]
+        local_render_debug = params.get("render_debug", self.render_debug)
         local_codec = params.get("codec", self.codec)
 
         self._clear_canvas_cache()
@@ -876,7 +880,7 @@ class VideoProcessorThread(QThread):
                 self._ensure_canvas(active_image_bgra, local_placement, frame_w, frame_h, warp_mode=local_warp_mode)
                 out_frame = composite_frame(prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=local_feather)
                 
-            if getattr(self, "_render_debug", False):
+            if local_render_debug:
                 from src.debug_draw import draw_debug_overlay
                 out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
                 
@@ -952,6 +956,7 @@ class VideoProcessorThread(QThread):
         local_endfade_offset = params.get("endfade_offset", 0)
         local_endfade_duration_frames = params.get("endfade_duration_frames", 60)
         local_endfade_base_quad = params.get("endfade_base_quad", None)
+        local_render_debug = params.get("render_debug", self.render_debug)
 
         writer = FfmpegFrameWriter(TEMP_RECORDING, frame_w, frame_h, fps, self.music_path, codec=local_codec, preset=self.preset)
 
@@ -1013,7 +1018,7 @@ class VideoProcessorThread(QThread):
                 ensure_local_canvas(active_image_bgra)
                 out_frame = composite_frame(prev_frame, active_quad_pts, local_cached_canvas_bgr, local_cached_canvas_alpha, feather=local_feather)
                         
-            if getattr(self, "_render_debug", False):
+            if local_render_debug:
                 from src.debug_draw import draw_debug_overlay
                 out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
 
@@ -1340,6 +1345,7 @@ class MainWindow(QMainWindow):
         
         self.cb_render_debug = QCheckBox("Render Debug Overlays")
         self.cb_render_debug.setToolTip("Renders the skeletal tracking and quad corners into the final exported video.")
+        self.cb_render_debug.stateChanged.connect(self.on_settings_changed)
         export_opt_layout.addWidget(self.cb_render_debug)
         
         # Unified Export button
@@ -1622,6 +1628,7 @@ class MainWindow(QMainWindow):
             "feather": self.slider_feather.value(),
             "coast_limit": self.slider_coast.value(),
             "show_debug": self.cb_debug.isChecked(),
+            "render_debug": self.cb_render_debug.isChecked(),
             "endfade_mode": is_endfade,
             "endfade_offset": self.slider_ef_offset.value(),
             "endfade_duration": self.slider_ef_dur.value(),
@@ -1696,6 +1703,22 @@ class MainWindow(QMainWindow):
         self.btn_record.setStyleSheet("background-color: #f0f0f0; color: black; font-weight: bold;")
         self.btn_export.setEnabled(True)
         self.progress_bar.hide()
+        
+        if os.path.exists(TEMP_RECORDING):
+            default_out = os.path.join(PROJECT_ROOT, "output", "webcam_recording.mp4")
+            save_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Recorded Video",
+                default_out,
+                "Video Files (*.mp4);;All Files (*.*)",
+            )
+            if save_path:
+                try:
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    shutil.copy2(TEMP_RECORDING, save_path)
+                    QMessageBox.information(self, "Recording Saved", f"Saved recording to:\n{save_path}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Save Error", f"Failed to save recording:\n{e}")
 
     def select_out_dir(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Select Output Directory", self.le_out_dir.text())
