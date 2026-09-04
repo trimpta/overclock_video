@@ -111,7 +111,7 @@ def composite_frame(frame_bgr, quad_pts, canvas_bgr, canvas_alpha, feather: int 
     """quad_pts: 4x2 int32 array in polygon winding order, or None if the
     quad isn't currently valid (image stays fully hidden this frame).
     """
-    if quad_pts is None:
+    if quad_pts is None or len(quad_pts) < 3:
         return frame_bgr
 
     h, w = frame_bgr.shape[:2]
@@ -147,8 +147,21 @@ def warp_composite_frame(frame_bgr, quad_pts, image_bgra, feather: int = 9):
     if quad_pts is None:
         return frame_bgr
 
+    try:
+        dst_pts = order_points_tl_tr_br_bl(quad_pts)
+        if not np.all(np.isfinite(dst_pts)):
+            return frame_bgr
+        ordered_i32 = np.round(dst_pts).astype(np.int32)
+        area = abs(cv2.contourArea(ordered_i32))
+        if area < 1.0:
+            return frame_bgr
+    except Exception:
+        return frame_bgr
+
     h, w = frame_bgr.shape[:2]
     img_h, img_w = image_bgra.shape[:2]
+    if img_w < 2 or img_h < 2:
+        return frame_bgr
 
     src_pts = np.array([
         [0, 0],
@@ -157,14 +170,14 @@ def warp_composite_frame(frame_bgr, quad_pts, image_bgra, feather: int = 9):
         [0, img_h]
     ], dtype=np.float32)
 
-    dst_pts = order_points_tl_tr_br_bl(quad_pts)
-    ordered_i32 = np.round(dst_pts).astype(np.int32)
-
-    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
-    warped = cv2.warpPerspective(
-        image_bgra, M, (w, h),
-        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0)
-    )
+    try:
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        warped = cv2.warpPerspective(
+            image_bgra, M, (w, h),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0)
+        )
+    except (cv2.error, ValueError, ZeroDivisionError):
+        return frame_bgr
 
     warped_bgr = warped[:, :, :3]
     warped_alpha = warped[:, :, 3]
