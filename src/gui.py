@@ -916,6 +916,8 @@ class VideoProcessorThread(QThread):
                 writer.close()
             except Exception as e:
                 raise RuntimeError(f"Failed to finalize export: {e}") from e
+            self.duration_changed.emit(current_frame_idx)
+            self.position_changed.emit(current_frame_idx)
             self._clear_canvas_cache()
 
     def _run_webcam_render_loop(self, frame_w, frame_h, fps):
@@ -1060,6 +1062,8 @@ class VideoProcessorThread(QThread):
                 self.error_occurred.emit(f"Failed to finalize webcam render: {e}")
             cap.release()
             if success:
+                self.duration_changed.emit(current_frame_idx)
+                self.position_changed.emit(current_frame_idx)
                 try:
                     os.remove(raw_path)
                 except Exception:
@@ -1752,8 +1756,9 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(int)
     def update_timeline_range(self, total_frames):
-        self.timeline.setRange(0, total_frames)
-        self.progress_bar.setRange(0, total_frames)
+        max_idx = max(0, total_frames - 1) if total_frames > 0 else 0
+        self.timeline.setRange(0, max_idx)
+        self.progress_bar.setRange(0, max(1, total_frames))
 
     @pyqtSlot(int)
     def update_timeline_pos(self, frame_idx):
