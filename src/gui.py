@@ -251,6 +251,10 @@ class VideoProcessorThread(QThread):
         self.glitch_fill_enabled = False
         self.glitch_fill_opacity = 0.8
         self._bass_analyzer = None
+
+        self.jagged_border_enabled = False
+        self.jagged_border_baseline = 0.0   # 0.0–1.0; maps to 0–max pixel displacement
+        self.jagged_border_thickness = 2    # px
         
         self.endfade_image_scale_enabled = False
         self.endfade_image_scale_offset = 0
@@ -377,6 +381,9 @@ class VideoProcessorThread(QThread):
         if "codec" in params: self.codec = params["codec"]
         if "glitch_fill_enabled" in params: self.glitch_fill_enabled = bool(params["glitch_fill_enabled"])
         if "glitch_fill_opacity" in params: self.glitch_fill_opacity = float(params["glitch_fill_opacity"])
+        if "jagged_border_enabled" in params: self.jagged_border_enabled = bool(params["jagged_border_enabled"])
+        if "jagged_border_baseline" in params: self.jagged_border_baseline = float(params["jagged_border_baseline"])
+        if "jagged_border_thickness" in params: self.jagged_border_thickness = int(params["jagged_border_thickness"])
         if "endfade_mode" in params:
             self.endfade_mode = params["endfade_mode"]
         if "endfade_offset" in params: self.endfade_offset = params["endfade_offset"]
@@ -514,6 +521,9 @@ class VideoProcessorThread(QThread):
             "overlay_end_frame": self.overlay_end_frame,
             "glitch_fill_enabled": self.glitch_fill_enabled,
             "glitch_fill_opacity": self.glitch_fill_opacity,
+            "jagged_border_enabled": self.jagged_border_enabled,
+            "jagged_border_baseline": self.jagged_border_baseline,
+            "jagged_border_thickness": self.jagged_border_thickness,
             "endfade_image_scale_enabled": self.endfade_image_scale_enabled,
             "endfade_image_scale_offset": self.endfade_image_scale_offset,
             "endfade_image_scale_duration": self.endfade_image_scale_duration,
@@ -1105,6 +1115,14 @@ class VideoProcessorThread(QThread):
                                     from src.debug_draw import draw_debug_overlay
                                     out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
 
+                                if self.jagged_border_enabled and active_quad_pts is not None:
+                                    bass = self._bass_analyzer.get_level(prev_frame_idx) if self._bass_analyzer else 0.0
+                                    from src.debug_draw import draw_jagged_border
+                                    out_frame = draw_jagged_border(
+                                        out_frame, active_quad_pts, bass,
+                                        self.jagged_border_baseline, self.jagged_border_thickness
+                                    )
+
                             if self.is_webcam:
                                 out_frame = cv2.flip(out_frame, 1)
 
@@ -1239,6 +1257,15 @@ class VideoProcessorThread(QThread):
                 if local_render_debug:
                     from src.debug_draw import draw_debug_overlay
                     out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
+
+                if params.get("jagged_border_enabled") and active_quad_pts is not None:
+                    bass = self._bass_analyzer.get_level(prev_frame_idx) if self._bass_analyzer else 0.0
+                    from src.debug_draw import draw_jagged_border
+                    out_frame = draw_jagged_border(
+                        out_frame, active_quad_pts, bass,
+                        params.get("jagged_border_baseline", 0.0),
+                        params.get("jagged_border_thickness", 2)
+                    )
 
             if not writer.write(out_frame) or writer.failed:
                 raise RuntimeError(writer.error_message or "Export write failed.")
@@ -1415,6 +1442,15 @@ class VideoProcessorThread(QThread):
             if local_render_debug:
                 from src.debug_draw import draw_debug_overlay
                 out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
+
+            if params.get("jagged_border_enabled") and active_quad_pts is not None:
+                bass = self._bass_analyzer.get_level(prev_frame_idx) if self._bass_analyzer else 0.0
+                from src.debug_draw import draw_jagged_border
+                out_frame = draw_jagged_border(
+                    out_frame, active_quad_pts, bass,
+                    params.get("jagged_border_baseline", 0.0),
+                    params.get("jagged_border_thickness", 2)
+                )
 
             out_frame = cv2.flip(out_frame, 1)
             self._emit_gui_frame(out_frame, fps, status_label="RENDERING...")
@@ -1641,6 +1677,32 @@ class MainWindow(QMainWindow):
         self.slider_glitch_opacity.setToolTip("How strongly the glitch fill blends in (0 = off, 100 = fully visible).")
         self.slider_glitch_opacity.valueChanged.connect(self.on_settings_changed)
         comp_layout.addRow("Glitch Opacity:", self.slider_glitch_opacity)
+
+        # --- Jagged Border ---
+        self.cb_jagged_border = QCheckBox("Jagged Border Overlay")
+        self.cb_jagged_border.setToolTip(
+            "Draws a white, bass-reactive jagged/zigzag outline around the tracked quad on every frame.\n"
+            "The shape is re-randomized each frame so it visually 'vibrates' with the music.\n"
+            "Layered on top of the debug overlay when both are active."
+        )
+        self.cb_jagged_border.stateChanged.connect(self.on_settings_changed)
+        comp_layout.addRow(self.cb_jagged_border)
+
+        self.slider_jagged_baseline = QSlider(Qt.Orientation.Horizontal)
+        self.slider_jagged_baseline.setRange(0, 100)
+        self.slider_jagged_baseline.setValue(0)
+        self.slider_jagged_baseline.setToolTip(
+            "Baseline jaggedness when there is no bass (0 = perfectly straight, 100 = always fully jagged)."
+        )
+        self.slider_jagged_baseline.valueChanged.connect(self.on_settings_changed)
+        comp_layout.addRow("Jag Baseline:", self.slider_jagged_baseline)
+
+        self.slider_jagged_thickness = QSlider(Qt.Orientation.Horizontal)
+        self.slider_jagged_thickness.setRange(1, 8)
+        self.slider_jagged_thickness.setValue(2)
+        self.slider_jagged_thickness.setToolTip("Line thickness of the jagged border in pixels (1–8).")
+        self.slider_jagged_thickness.valueChanged.connect(self.on_settings_changed)
+        comp_layout.addRow("Jag Thickness:", self.slider_jagged_thickness)
 
         self.slider_feather = QSlider(Qt.Orientation.Horizontal)
         self.slider_feather.setToolTip("Applies a soft blur to the mask edges to blend the image seamlessly with the video.")
@@ -1899,7 +1961,9 @@ class MainWindow(QMainWindow):
         widgets = (
             self.cb_warp, self.cb_endfade, self.cb_glitch_fill, self.cb_ef_image_scale,
             self.cb_record_mic, self.cb_mic_device, self.cb_codec,
+            self.cb_jagged_border,
             self.slider_feather, self.slider_coast, self.slider_glitch_opacity,
+            self.slider_jagged_baseline, self.slider_jagged_thickness,
             self.slider_ef_offset, self.slider_ef_dur,
             self.slider_ef_img_offset, self.slider_ef_img_dur,
             self.slider_scale, self.slider_rot,
@@ -1921,9 +1985,16 @@ class MainWindow(QMainWindow):
             if "glitch_fill_enabled" in settings:
                 self.cb_glitch_fill.setChecked(bool(settings["glitch_fill_enabled"]))
             if "glitch_fill_opacity" in settings:
-                self.slider_glitch_opacity.setValue(max(0, min(100, int(settings["glitch_fill_opacity"]))))
+                self.slider_glitch_opacity.setValue(max(0, min(100, int(settings["glitch_fill_opacity"] * 100.0))))
+            if "jagged_border_enabled" in settings:
+                self.cb_jagged_border.setChecked(bool(settings["jagged_border_enabled"]))
+            if "jagged_border_baseline" in settings:
+                self.slider_jagged_baseline.setValue(max(0, min(100, int(settings["jagged_border_baseline"] * 100.0))))
+            if "jagged_border_thickness" in settings:
+                self.slider_jagged_thickness.setValue(max(1, min(8, int(settings["jagged_border_thickness"]))))
             if "feather" in settings:
                 self.slider_feather.setValue(max(0, min(31, int(settings["feather"]))))
+
             if "coast_limit" in settings:
                 self.slider_coast.setValue(max(0, min(60, int(settings["coast_limit"]))))
             if "endfade_offset" in settings:
@@ -2172,6 +2243,10 @@ class MainWindow(QMainWindow):
             
         glitch_on = self.cb_glitch_fill.isChecked() and not self.cb_warp.isChecked()
         self.slider_glitch_opacity.setVisible(glitch_on)
+
+        jagged_on = self.cb_jagged_border.isChecked()
+        self.slider_jagged_baseline.setVisible(jagged_on)
+        self.slider_jagged_thickness.setVisible(jagged_on)
             
         params = {
             "record_mic": self.cb_record_mic.isChecked(),
@@ -2189,7 +2264,11 @@ class MainWindow(QMainWindow):
             "endfade_image_scale_duration": self.slider_ef_img_dur.value(),
             "glitch_fill_enabled": glitch_on,
             "glitch_fill_opacity": self.slider_glitch_opacity.value() / 100.0,
+            "jagged_border_enabled": jagged_on,
+            "jagged_border_baseline": self.slider_jagged_baseline.value() / 100.0,
+            "jagged_border_thickness": self.slider_jagged_thickness.value(),
             "codec": codec_str,
+
             "placement": {
                 "x": self.slider_x.value(),
                 "y": self.slider_y.value(),

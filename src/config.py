@@ -158,12 +158,17 @@ def session_compositing_settings(data):
         ("endfade_image_scale_duration", int),
         ("feather", int),
         ("coast_limit", int),
+        ("jagged_border_baseline", float),
+        ("jagged_border_thickness", int),
     ):
         if key in data and data[key] is not None:
             try:
                 out[key] = caster(data[key])
             except (TypeError, ValueError):
                 pass
+    if "jagged_border_enabled" in data:
+        out["jagged_border_enabled"] = bool(data["jagged_border_enabled"])
+
     if "endfade_image_scale_enabled" in data:
         out["endfade_image_scale_enabled"] = bool(data["endfade_image_scale_enabled"])
     codec = data.get("codec")
