@@ -8,8 +8,8 @@ import cv2
 import numpy as np
 import concurrent.futures
 
-from PyQt6.QtCore import Qt, QThread, QRectF, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QImage, QPixmap, QPalette, QColor
+from PyQt6.QtCore import Qt, QThread, QRectF, QPointF, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QImage, QPixmap, QPalette, QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QSlider, QCheckBox,
@@ -30,7 +30,7 @@ from src.config import (
     save_last_run,
     session_compositing_settings,
 )
-from src.compositor import build_canvas, composite_frame, warp_composite_frame, load_image_bgra, make_greenscreen_bgra, make_grid_bgra, full_frame_placement
+from src.compositor import build_canvas, composite_frame, warp_composite_frame, load_image_bgra, make_greenscreen_bgra, make_grid_bgra, full_frame_placement, glitch_fill_frame, placement_for_endfade_scale
 from src.hand_tracking import HandTracker
 from src.smoothing import QuadTracker, order_points_tl_tr_br_bl
 
@@ -59,12 +59,91 @@ class PreviewLabel(QLabel):
         self.warp_mode = False
         self.frame_size = (1920, 1080) # default, updated by thread
 
+        # Editor-only aid: draws the full placed image (ghosted outside the hand
+        # quad, since that area already shows it opaque) plus a draggable border.
+        self.show_placement_overlay = False
+        self.overlay_image_pixmap = None
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.size_changed.emit(self.width(), self.height())
 
     def update_placement(self, placement):
         self.current_placement.update(placement)
+        if self.show_placement_overlay:
+            self.update()
+
+    def set_overlay_image_pixmap(self, pixmap):
+        self.overlay_image_pixmap = pixmap
+        if self.show_placement_overlay:
+            self.update()
+
+    def _placement_rect(self, content):
+        """Placement rect (unrotated, centered at 0,0) in widget coords, and its
+        on-screen center, for the current placement/frame_size/content mapping."""
+        p = self.current_placement
+        fw, fh = max(1, self.frame_size[0]), max(1, self.frame_size[1])
+        scale_x = content.width() / fw
+        scale_y = content.height() / fh
+        cx = content.x() + p.get("x", fw / 2.0) * scale_x
+        cy = content.y() + p.get("y", fh / 2.0) * scale_y
+        pscale = p.get("scale", 1.0)
+        if self.overlay_image_pixmap is not None and not self.overlay_image_pixmap.isNull():
+            native_w = self.overlay_image_pixmap.width()
+            native_h = self.overlay_image_pixmap.height()
+        else:
+            native_w, native_h = fw, fh
+        draw_w = native_w * pscale * scale_x
+        draw_h = native_h * pscale * scale_y
+        return QPointF(cx, cy), QRectF(-draw_w / 2.0, -draw_h / 2.0, draw_w, draw_h)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.show_placement_overlay or self.warp_mode:
+            return
+        content = self._content_rect()
+        if content is None:
+            return
+
+        center, rect = self._placement_rect(content)
+        rotation = self.current_placement.get("rotation_deg", 0.0)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.translate(center)
+        painter.rotate(rotation)
+
+        pixmap = self.overlay_image_pixmap
+        if pixmap is not None and not pixmap.isNull():
+            painter.setOpacity(0.5)
+            painter.drawPixmap(rect, pixmap, QRectF(pixmap.rect()))
+            painter.setOpacity(1.0)
+
+        pen = QPen(QColor(255, 165, 0))
+        pen.setWidth(2)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(rect)
+
+        handle_pen = QPen(QColor(255, 140, 0))
+        handle_pen.setWidth(1)
+        handle_pen.setCosmetic(True)
+        painter.setPen(handle_pen)
+        painter.setBrush(QColor(255, 200, 80))
+        corner_r, mid_r = 5.0, 3.5
+        for pt in (rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()):
+            painter.drawEllipse(pt, corner_r, corner_r)
+        mid_points = (
+            QPointF(rect.center().x(), rect.top()),
+            QPointF(rect.center().x(), rect.bottom()),
+            QPointF(rect.left(), rect.center().y()),
+            QPointF(rect.right(), rect.center().y()),
+        )
+        for pt in mid_points:
+            painter.drawEllipse(pt, mid_r, mid_r)
+        painter.end()
 
     def _content_rect(self):
         """Painted pixmap rect: QLabel centers an unscaled pixmap in contentsRect."""
@@ -126,6 +205,8 @@ class PreviewLabel(QLabel):
             self.current_placement["scale"] = max(0.01, self.current_placement["scale"] + scale_delta)
 
         self.placement_changed.emit(self.current_placement)
+        if self.show_placement_overlay:
+            self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -145,6 +226,9 @@ class VideoProcessorThread(QThread):
     endfade_scan_complete = pyqtSignal(int, np.ndarray)
     endfade_scan_failed = pyqtSignal(str)
     endfade_trigger_failed = pyqtSignal(str)
+    overlay_start_set = pyqtSignal(int)
+    overlay_stop_set = pyqtSignal(int)
+    overlay_marker_failed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -163,6 +247,14 @@ class VideoProcessorThread(QThread):
         self.coast_limit = 15
         self.show_debug = False
         self.render_debug = False
+        
+        self.glitch_fill_enabled = False
+        self.glitch_fill_opacity = 0.8
+        self._bass_analyzer = None
+        
+        self.endfade_image_scale_enabled = False
+        self.endfade_image_scale_offset = 0
+        self.endfade_image_scale_duration = 60
 
         self._running = False
         self._paused = False
@@ -185,6 +277,15 @@ class VideoProcessorThread(QThread):
         self.frame_h = None
         self.proxy_w = None
         self.proxy_h = None
+
+        # Overlay content (image reveal, warp, debug overlay, endfade) is only
+        # rendered within [overlay_start_frame, overlay_end_frame]; outside that
+        # window the raw source frame passes through untouched. Playback itself
+        # is never trimmed. File-mode only (not webcam).
+        self.overlay_start_frame = None
+        self.overlay_end_frame = None
+        self._overlay_window_entered = False
+        self._last_preview_frame_idx = None
 
         self._recording = False
         self._exporting = False
@@ -274,10 +375,15 @@ class VideoProcessorThread(QThread):
         if "placement" in params:
             self.placement.update(params["placement"])
         if "codec" in params: self.codec = params["codec"]
+        if "glitch_fill_enabled" in params: self.glitch_fill_enabled = bool(params["glitch_fill_enabled"])
+        if "glitch_fill_opacity" in params: self.glitch_fill_opacity = float(params["glitch_fill_opacity"])
         if "endfade_mode" in params:
             self.endfade_mode = params["endfade_mode"]
         if "endfade_offset" in params: self.endfade_offset = params["endfade_offset"]
         if "endfade_duration" in params: self.endfade_duration_frames = params["endfade_duration"]
+        if "endfade_image_scale_enabled" in params: self.endfade_image_scale_enabled = bool(params["endfade_image_scale_enabled"])
+        if "endfade_image_scale_offset" in params: self.endfade_image_scale_offset = int(params["endfade_image_scale_offset"])
+        if "endfade_image_scale_duration" in params: self.endfade_image_scale_duration = int(params["endfade_image_scale_duration"])
 
     def request_endfade_scan(self):
         """Auto-detect the trigger frame by scanning for the last frame hands are visible."""
@@ -300,6 +406,45 @@ class VideoProcessorThread(QThread):
         scale_y = self.frame_h / self.proxy_h
         self.endfade_base_quad = np.round(base_quad_proxy * [scale_x, scale_y]).astype(np.int32)
         self.endfade_scan_complete.emit(self.endfade_trigger_frame, self.endfade_base_quad)
+
+    def _overlay_window_active(self, frame_idx):
+        """Whether tracking/overlay content (image reveal, warp, debug overlay,
+        endfade) should render at this frame. Playback always plays in full;
+        this only gates the composited content on top of it."""
+        if self.overlay_start_frame is None:
+            return True
+        if frame_idx < self.overlay_start_frame:
+            return False
+        if self.overlay_end_frame is not None and frame_idx > self.overlay_end_frame:
+            return False
+        return True
+
+    def set_overlay_start_here(self):
+        """Mark the currently-displayed frame as where overlay content begins.
+        Clears any previously-set end point."""
+        if self.is_webcam:
+            return
+        if self._last_preview_frame_idx is None:
+            self.overlay_marker_failed.emit("No frame displayed yet — let the preview show a frame first.")
+            return
+        self.overlay_start_frame = self._last_preview_frame_idx
+        self.overlay_end_frame = None
+        self._overlay_window_entered = False
+        self.overlay_start_set.emit(self.overlay_start_frame)
+
+    def set_overlay_stop_here(self):
+        """Mark the currently-displayed frame as where overlay content ends."""
+        if self.is_webcam:
+            return
+        if self._last_preview_frame_idx is None or self.overlay_start_frame is None:
+            self.overlay_marker_failed.emit("Set a start point first.")
+            return
+        end = self._last_preview_frame_idx
+        if end < self.overlay_start_frame:
+            self.overlay_marker_failed.emit("Stop point is before the start point — seek forward and try again.")
+            return
+        self.overlay_end_frame = end
+        self.overlay_stop_set.emit(self.overlay_end_frame)
 
     def set_gui_size(self, w, h):
         self.target_gui_size = (w, h)
@@ -365,6 +510,13 @@ class VideoProcessorThread(QThread):
             "endfade_base_quad": self.endfade_base_quad.copy() if self.endfade_base_quad is not None else None,
             "endfade_base_quad_proxy": self.endfade_base_quad_proxy.copy() if self.endfade_base_quad_proxy is not None else None,
             "endfade_trigger_frame": self.endfade_trigger_frame,
+            "overlay_start_frame": self.overlay_start_frame,
+            "overlay_end_frame": self.overlay_end_frame,
+            "glitch_fill_enabled": self.glitch_fill_enabled,
+            "glitch_fill_opacity": self.glitch_fill_opacity,
+            "endfade_image_scale_enabled": self.endfade_image_scale_enabled,
+            "endfade_image_scale_offset": self.endfade_image_scale_offset,
+            "endfade_image_scale_duration": self.endfade_image_scale_duration,
             "codec": self.codec,
             "render_debug": self.render_debug,
             "record_mic": self.record_mic,
@@ -534,6 +686,14 @@ class VideoProcessorThread(QThread):
         self._clear_canvas_cache()
         self._live_quad_ordered_proxy = None
         self._live_quad_frame_idx = None
+        self.overlay_start_frame = None
+        self.overlay_end_frame = None
+        self._overlay_window_entered = False
+        self._last_preview_frame_idx = None
+        
+        from src.bass_analyzer import BassAnalyzer
+        self._bass_analyzer = BassAnalyzer(self.music_path, fps) if self.music_path else None
+        
         return fps, frame_w, frame_h, total_frames, proxy_w, proxy_h
 
     def _ensure_canvas(self, active_image_bgra, placement, cache_w, cache_h, proxy_scale=1.0, warp_mode=None):
@@ -581,6 +741,28 @@ class VideoProcessorThread(QThread):
         if active_quad_pts is not None and quad_pts is None:
             return active_quad_pts
         return active_quad_pts
+
+    def _compute_endfade_image_placement(self, prev_frame_idx, base_placement, image_bgra, frame_w, frame_h, params=None):
+        """Returns an interpolated placement dict that grows the image to fill the frame.
+        Uses the same ease-in/ease-out curve as the mask expansion but on independent timing.
+        Returns base_placement unchanged if the feature is disabled or not yet triggered.
+        """
+        p = params or {}
+        if not p.get("endfade_image_scale_enabled", self.endfade_image_scale_enabled):
+            return base_placement
+        if p.get("warp_mode", self.warp_mode):
+            return base_placement
+        trigger_frame = p.get("endfade_trigger_frame", self.endfade_trigger_frame)
+        if trigger_frame is None or p.get("is_webcam", self.is_webcam):
+            return base_placement
+        offset = p.get("endfade_image_scale_offset", self.endfade_image_scale_offset)
+        duration = p.get("endfade_image_scale_duration", self.endfade_image_scale_duration)
+        trigger = trigger_frame + offset
+        if prev_frame_idx < trigger:
+            return base_placement
+        raw_progress = min(1.0, (prev_frame_idx - trigger) / max(1, duration))
+        progress = raw_progress * raw_progress * (3 - 2 * raw_progress)  # smoothstep ease
+        return placement_for_endfade_scale(base_placement, image_bgra, frame_w, frame_h, progress)
 
     def _emit_gui_frame(self, out_frame, fps, force=False, status_label=None):
         ow, oh = out_frame.shape[1], out_frame.shape[0]
@@ -867,37 +1049,61 @@ class VideoProcessorThread(QThread):
                         if prev_frame is not None and future_tracker is not None:
                             if not self.is_webcam:
                                 self.position_changed.emit(prev_frame_idx)
+                                self._last_preview_frame_idx = prev_frame_idx
 
                             hand_result = future_tracker.result()
 
-                            self.quad_tracker.coast_limit = self.coast_limit
-                            smoothed = self.quad_tracker.update(hand_result.roles)
-                            quad_pts = self._quad_pts_for_mode(smoothed)
-
+                            overlay_active = self.is_webcam or self._overlay_window_active(prev_frame_idx)
                             if not self.is_webcam:
-                                ordered = QuadTracker.ordered_quad_points(smoothed)
-                                if ordered is not None:
-                                    self._live_quad_ordered_proxy = np.round(ordered).astype(np.int32)
-                                    self._live_quad_frame_idx = prev_frame_idx
+                                if overlay_active and not self._overlay_window_entered:
+                                    # Entering the marked window: start tracking fresh from
+                                    # here, no bleed-through from hands before this point.
+                                    self.quad_tracker.reset()
+                                    self._overlay_window_entered = True
+                                elif not overlay_active:
+                                    self._overlay_window_entered = False
 
-                            active_quad_pts = self._compute_endfade_quad(
-                                prev_frame_idx, quad_pts, frame_w, frame_h, proxy_w, proxy_h,
-                                use_proxy=True, endfade_base_quad_proxy=self.endfade_base_quad_proxy,
-                            )
-
-                            active_image_bgra = self.image_bgra
-                            if not getattr(self, "has_custom_image", True) and self.warp_mode:
-                                active_image_bgra = self.grid_bgra
-
-                            if self.warp_mode:
-                                out_frame = warp_composite_frame(proxy_prev_frame, active_quad_pts, active_image_bgra, feather=self.feather)
+                            if not overlay_active:
+                                out_frame = proxy_prev_frame
                             else:
-                                self._ensure_canvas(active_image_bgra, self.placement, proxy_w, proxy_h, proxy_scale=self.proxy_scale)
-                                out_frame = composite_frame(proxy_prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=self.feather)
+                                self.quad_tracker.coast_limit = self.coast_limit
+                                smoothed = self.quad_tracker.update(hand_result.roles)
+                                quad_pts = self._quad_pts_for_mode(smoothed)
 
-                            if self.show_debug:
-                                from src.debug_draw import draw_debug_overlay
-                                out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
+                                if not self.is_webcam:
+                                    ordered = QuadTracker.ordered_quad_points(smoothed)
+                                    if ordered is not None:
+                                        self._live_quad_ordered_proxy = np.round(ordered).astype(np.int32)
+                                        self._live_quad_frame_idx = prev_frame_idx
+
+                                active_quad_pts = self._compute_endfade_quad(
+                                    prev_frame_idx, quad_pts, frame_w, frame_h, proxy_w, proxy_h,
+                                    use_proxy=True, endfade_base_quad_proxy=self.endfade_base_quad_proxy,
+                                )
+
+                                active_image_bgra = self.image_bgra
+                                if not getattr(self, "has_custom_image", True) and self.warp_mode:
+                                    active_image_bgra = self.grid_bgra
+
+                                if self.warp_mode:
+                                    out_frame = warp_composite_frame(proxy_prev_frame, active_quad_pts, active_image_bgra, feather=self.feather)
+                                else:
+                                    ef_placement = self._compute_endfade_image_placement(
+                                        prev_frame_idx, self.placement, self.image_bgra, self.frame_w, self.frame_h
+                                    )
+                                    self._ensure_canvas(active_image_bgra, ef_placement, proxy_w, proxy_h, proxy_scale=self.proxy_scale)
+                                    out_frame = composite_frame(proxy_prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=self.feather)
+                                    
+                                    if self.glitch_fill_enabled and active_quad_pts is not None:
+                                        bass = self._bass_analyzer.get_level(prev_frame_idx) if self._bass_analyzer else 0.0
+                                        out_frame = glitch_fill_frame(
+                                            proxy_prev_frame, out_frame, active_quad_pts, 
+                                            self._cached_canvas_alpha, bass, self.glitch_fill_opacity, self.feather
+                                        )
+
+                                if self.show_debug:
+                                    from src.debug_draw import draw_debug_overlay
+                                    out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
 
                             if self.is_webcam:
                                 out_frame = cv2.flip(out_frame, 1)
@@ -969,41 +1175,74 @@ class VideoProcessorThread(QThread):
 
         writer = FfmpegFrameWriter(temp_export_path, frame_w, frame_h, fps, self.music_path, codec=local_codec, preset=self.preset)
         
+        local_overlay_start = params.get("overlay_start_frame")
+        local_overlay_end = params.get("overlay_end_frame")
+
+        def overlay_active(frame_idx):
+            if local_overlay_start is None:
+                return True
+            if frame_idx < local_overlay_start:
+                return False
+            if local_overlay_end is not None and frame_idx > local_overlay_end:
+                return False
+            return True
+
         future_tracker = None
         prev_frame = None
         prev_frame_idx = 0
         current_frame_idx = 0
+        overlay_entered = False
 
         def process_prev():
-            nonlocal prev_frame_idx
+            nonlocal prev_frame_idx, overlay_entered
             hand_result = future_tracker.result()
-            self.quad_tracker.coast_limit = local_coast_limit
-            smoothed = self.quad_tracker.update(hand_result.roles)
-            quad_pts = self._quad_pts_for_mode(smoothed, warp_mode=local_warp_mode)
+            active = overlay_active(prev_frame_idx)
+            if active and not overlay_entered:
+                self.quad_tracker.reset()
+                overlay_entered = True
+            elif not active:
+                overlay_entered = False
 
-            active_quad_pts = self._compute_endfade_quad(
-                prev_frame_idx, quad_pts, frame_w, frame_h, frame_w, frame_h,
-                use_proxy=False, endfade_base_quad=params.get("endfade_base_quad"),
-                params=params,
-            )
-
-            active_image_bgra = self.full_image_bgra
-            if not getattr(self, "has_custom_image", True) and local_warp_mode:
-                active_image_bgra = self.full_grid_bgra
-
-            if local_warp_mode:
-                out_frame = warp_composite_frame(prev_frame, active_quad_pts, active_image_bgra, feather=local_feather)
+            if not active:
+                out_frame = prev_frame
             else:
-                self._ensure_canvas(active_image_bgra, local_placement, frame_w, frame_h, warp_mode=local_warp_mode)
-                out_frame = composite_frame(prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=local_feather)
-                
-            if local_render_debug:
-                from src.debug_draw import draw_debug_overlay
-                out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
-                
+                self.quad_tracker.coast_limit = local_coast_limit
+                smoothed = self.quad_tracker.update(hand_result.roles)
+                quad_pts = self._quad_pts_for_mode(smoothed, warp_mode=local_warp_mode)
+
+                active_quad_pts = self._compute_endfade_quad(
+                    prev_frame_idx, quad_pts, frame_w, frame_h, frame_w, frame_h,
+                    use_proxy=False, endfade_base_quad=params.get("endfade_base_quad"),
+                    params=params,
+                )
+
+                active_image_bgra = self.full_image_bgra
+                if not getattr(self, "has_custom_image", True) and local_warp_mode:
+                    active_image_bgra = self.full_grid_bgra
+
+                if local_warp_mode:
+                    out_frame = warp_composite_frame(prev_frame, active_quad_pts, active_image_bgra, feather=local_feather)
+                else:
+                    ef_placement = self._compute_endfade_image_placement(
+                        prev_frame_idx, local_placement, self.full_image_bgra, frame_w, frame_h, params=params
+                    )
+                    self._ensure_canvas(active_image_bgra, ef_placement, frame_w, frame_h, warp_mode=local_warp_mode)
+                    out_frame = composite_frame(prev_frame, active_quad_pts, self._cached_canvas_bgr, self._cached_canvas_alpha, feather=local_feather)
+                    
+                    if params.get("glitch_fill_enabled") and active_quad_pts is not None:
+                        bass = self._bass_analyzer.get_level(prev_frame_idx) if self._bass_analyzer else 0.0
+                        out_frame = glitch_fill_frame(
+                            prev_frame, out_frame, active_quad_pts, 
+                            self._cached_canvas_alpha, bass, params.get("glitch_fill_opacity", 0.0), local_feather
+                        )
+
+                if local_render_debug:
+                    from src.debug_draw import draw_debug_overlay
+                    out_frame = draw_debug_overlay(out_frame, hand_result.hands_raw, smoothed, active_quad_pts)
+
             if not writer.write(out_frame) or writer.failed:
                 raise RuntimeError(writer.error_message or "Export write failed.")
-            
+
             if prev_frame_idx % 10 == 0:
                 self.position_changed.emit(prev_frame_idx)
         
@@ -1114,7 +1353,7 @@ class VideoProcessorThread(QThread):
         local_last_placement = None
         local_cached_canvas_size = None
 
-        def ensure_local_canvas(active_image_bgra):
+        def ensure_local_canvas(active_image_bgra, placement_override=None):
             nonlocal local_cached_canvas_bgr, local_cached_canvas_alpha, local_last_placement, local_cached_canvas_size
             cache_key_size = (frame_w, frame_h)
             if not getattr(self, "has_custom_image", True) and not local_warp_mode:
@@ -1123,9 +1362,10 @@ class VideoProcessorThread(QThread):
                     local_cached_canvas_alpha = active_image_bgra[:, :, 3].copy()
                     local_cached_canvas_size = cache_key_size
                 return
-            if local_last_placement != local_placement or local_cached_canvas_bgr is None or local_cached_canvas_size != cache_key_size:
-                local_cached_canvas_bgr, local_cached_canvas_alpha = build_canvas(active_image_bgra, local_placement, frame_w, frame_h)
-                local_last_placement = local_placement.copy()
+            effective_placement = placement_override if placement_override is not None else local_placement
+            if local_last_placement != effective_placement or local_cached_canvas_bgr is None or local_cached_canvas_size != cache_key_size:
+                local_cached_canvas_bgr, local_cached_canvas_alpha = build_canvas(active_image_bgra, effective_placement, frame_w, frame_h)
+                local_last_placement = effective_placement.copy()
                 local_cached_canvas_size = cache_key_size
 
         def compute_local_endfade(prev_idx, quad_pts):
@@ -1159,8 +1399,18 @@ class VideoProcessorThread(QThread):
             if local_warp_mode:
                 out_frame = warp_composite_frame(prev_frame, active_quad_pts, active_image_bgra, feather=local_feather)
             else:
-                ensure_local_canvas(active_image_bgra)
+                ef_placement = self._compute_endfade_image_placement(
+                    prev_frame_idx, local_placement, self.full_image_bgra, frame_w, frame_h, params=params
+                )
+                ensure_local_canvas(active_image_bgra, placement_override=ef_placement if ef_placement is not local_placement else None)
                 out_frame = composite_frame(prev_frame, active_quad_pts, local_cached_canvas_bgr, local_cached_canvas_alpha, feather=local_feather)
+                
+                if params.get("glitch_fill_enabled") and active_quad_pts is not None:
+                    bass = self._bass_analyzer.get_level(prev_frame_idx) if self._bass_analyzer else 0.0
+                    out_frame = glitch_fill_frame(
+                        prev_frame, out_frame, active_quad_pts, 
+                        local_cached_canvas_alpha, bass, params.get("glitch_fill_opacity", 0.0), local_feather
+                    )
                         
             if local_render_debug:
                 from src.debug_draw import draw_debug_overlay
@@ -1242,6 +1492,13 @@ class ImageAdjustDialog(QDialog):
         self.setWindowTitle("Image Adjust Editor")
         self.setMinimumSize(820, 500)
         layout = QVBoxLayout(self)
+        hint = QLabel(
+            "Orange outline + handles = drag to move, drag the edges to scale. "
+            "Faded area is the full image; it's only revealed through the hand quad at full opacity."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(hint)
         self.preview = PreviewLabel()
         self.preview.setMinimumSize(800, 450)
         self.preview.frame_size = frame_size
@@ -1270,12 +1527,16 @@ class MainWindow(QMainWindow):
         self.processor.endfade_scan_complete.connect(self.on_endfade_complete)
         self.processor.endfade_scan_failed.connect(self.on_endfade_scan_failed)
         self.processor.endfade_trigger_failed.connect(self.on_endfade_trigger_failed)
+        self.processor.overlay_start_set.connect(self.on_overlay_start_set)
+        self.processor.overlay_stop_set.connect(self.on_overlay_stop_set)
+        self.processor.overlay_marker_failed.connect(self.on_overlay_marker_failed)
         self.processor.resolution_changed.connect(self.on_resolution_changed)
         
         self.init_ui()
         self._is_webcam = False
         self._user_is_seeking = False
         self._image_adjust_dialog = None
+        self._overlay_image_pixmap = None
         self._last_preview_pixmap = None
         self._last_frame_size = None
         self._pending_restore_placement = None
@@ -1364,6 +1625,22 @@ class MainWindow(QMainWindow):
         self.cb_endfade.setToolTip("Automatically identifies when your hands leave the frame near the end of the video,\nand transitions the image to fill the screen.")
         self.cb_endfade.stateChanged.connect(self.on_settings_changed)
         comp_layout.addRow(self.cb_endfade)
+        
+        self.cb_glitch_fill = QCheckBox("Glitch Fill (Gap Layer)")
+        self.cb_glitch_fill.setToolTip(
+            "In static-placement mode, fills the gap inside the hand quad where your image\n"
+            "doesn't cover with a colour-inverted, blue-shifted, bass-reactive glitch layer.\n"
+            "Only active in static (non-warp) mode."
+        )
+        self.cb_glitch_fill.stateChanged.connect(self.on_settings_changed)
+        comp_layout.addRow(self.cb_glitch_fill)
+
+        self.slider_glitch_opacity = QSlider(Qt.Orientation.Horizontal)
+        self.slider_glitch_opacity.setRange(0, 100)
+        self.slider_glitch_opacity.setValue(80)
+        self.slider_glitch_opacity.setToolTip("How strongly the glitch fill blends in (0 = off, 100 = fully visible).")
+        self.slider_glitch_opacity.valueChanged.connect(self.on_settings_changed)
+        comp_layout.addRow("Glitch Opacity:", self.slider_glitch_opacity)
 
         self.slider_feather = QSlider(Qt.Orientation.Horizontal)
         self.slider_feather.setToolTip("Applies a soft blur to the mask edges to blend the image seamlessly with the video.")
@@ -1406,6 +1683,31 @@ class MainWindow(QMainWindow):
         self.slider_ef_dur.setValue(60)
         self.slider_ef_dur.valueChanged.connect(self.on_settings_changed_slider)
         endfade_layout.addRow("Duration (frames):", self.slider_ef_dur)
+        
+        endfade_layout.addRow(QLabel("─── Image Scale (static mode) ───"))
+        
+        self.cb_ef_image_scale = QCheckBox("Expand image to fill frame")
+        self.cb_ef_image_scale.setToolTip(
+            "Independently animates the placed image from its current size/position up to\n"
+            "letterbox-fill the entire frame. Uses its own start offset and duration, separate\n"
+            "from the mask expansion above. Static mode only."
+        )
+        self.cb_ef_image_scale.stateChanged.connect(self.on_settings_changed)
+        endfade_layout.addRow(self.cb_ef_image_scale)
+        
+        self.slider_ef_img_offset = QSlider(Qt.Orientation.Horizontal)
+        self.slider_ef_img_offset.setRange(-120, 120)
+        self.slider_ef_img_offset.setValue(0)
+        self.slider_ef_img_offset.setToolTip("Start the image scale animation this many frames before/after the endfade trigger.\nNegative = start before the trigger; positive = start after.")
+        self.slider_ef_img_offset.valueChanged.connect(self.on_settings_changed_slider)
+        endfade_layout.addRow("Img Scale Offset:", self.slider_ef_img_offset)
+        
+        self.slider_ef_img_dur = QSlider(Qt.Orientation.Horizontal)
+        self.slider_ef_img_dur.setRange(15, 240)
+        self.slider_ef_img_dur.setValue(60)
+        self.slider_ef_img_dur.setToolTip("How many frames the image scale-up animation takes to complete.")
+        self.slider_ef_img_dur.valueChanged.connect(self.on_settings_changed_slider)
+        endfade_layout.addRow("Img Scale Duration:", self.slider_ef_img_dur)
         
         self.lbl_ef_status = QLabel("Ready")
         endfade_layout.addRow(self.lbl_ef_status)
@@ -1479,7 +1781,19 @@ class MainWindow(QMainWindow):
         self.btn_play_pause.clicked.connect(self.toggle_play_pause)
         self.btn_play_pause.hide()
         bottom_layout.addWidget(self.btn_play_pause)
-        
+
+        self._overlay_stage = "start"
+        self.btn_overlay_window = QPushButton("Start Here")
+        self.btn_overlay_window.setToolTip(
+            "Pause on a frame, then click to mark where tracking/overlay content\n"
+            "(image reveal, warp, debug overlay, endfade) should begin. Pause again\n"
+            "on a later frame to mark where it should end. Playback itself is unaffected."
+        )
+        self.btn_overlay_window.setEnabled(False)
+        self.btn_overlay_window.clicked.connect(self.on_overlay_window_clicked)
+        self.btn_overlay_window.hide()
+        bottom_layout.addWidget(self.btn_overlay_window)
+
         self.timeline = QSlider(Qt.Orientation.Horizontal)
         self.timeline.sliderPressed.connect(self.on_timeline_pressed)
         self.timeline.sliderReleased.connect(self.on_timeline_released)
@@ -1569,8 +1883,13 @@ class MainWindow(QMainWindow):
             },
             "warp_mode": self.cb_warp.isChecked(),
             "endfade_mode": self.cb_endfade.isChecked(),
+            "glitch_fill_enabled": self.cb_glitch_fill.isChecked(),
+            "glitch_fill_opacity": self.slider_glitch_opacity.value(),
             "endfade_offset": self.slider_ef_offset.value(),
             "endfade_duration": self.slider_ef_dur.value(),
+            "endfade_image_scale_enabled": self.cb_ef_image_scale.isChecked(),
+            "endfade_image_scale_offset": self.slider_ef_img_offset.value(),
+            "endfade_image_scale_duration": self.slider_ef_img_dur.value(),
             "feather": self.slider_feather.value(),
             "coast_limit": self.slider_coast.value(),
             "codec": self.cb_codec.currentText().split(" ")[0],
@@ -1578,9 +1897,11 @@ class MainWindow(QMainWindow):
 
     def _apply_restored_compositing(self, settings):
         widgets = (
-            self.cb_warp, self.cb_endfade, self.cb_record_mic, self.cb_mic_device, self.cb_codec,
-            self.slider_feather, self.slider_coast,
+            self.cb_warp, self.cb_endfade, self.cb_glitch_fill, self.cb_ef_image_scale,
+            self.cb_record_mic, self.cb_mic_device, self.cb_codec,
+            self.slider_feather, self.slider_coast, self.slider_glitch_opacity,
             self.slider_ef_offset, self.slider_ef_dur,
+            self.slider_ef_img_offset, self.slider_ef_img_dur,
             self.slider_scale, self.slider_rot,
         )
         for w in widgets:
@@ -1597,6 +1918,10 @@ class MainWindow(QMainWindow):
                 self.cb_warp.setChecked(bool(settings["warp_mode"]))
             if "endfade_mode" in settings:
                 self.cb_endfade.setChecked(bool(settings["endfade_mode"]))
+            if "glitch_fill_enabled" in settings:
+                self.cb_glitch_fill.setChecked(bool(settings["glitch_fill_enabled"]))
+            if "glitch_fill_opacity" in settings:
+                self.slider_glitch_opacity.setValue(max(0, min(100, int(settings["glitch_fill_opacity"]))))
             if "feather" in settings:
                 self.slider_feather.setValue(max(0, min(31, int(settings["feather"]))))
             if "coast_limit" in settings:
@@ -1605,6 +1930,12 @@ class MainWindow(QMainWindow):
                 self.slider_ef_offset.setValue(max(-120, min(120, int(settings["endfade_offset"]))))
             if "endfade_duration" in settings:
                 self.slider_ef_dur.setValue(max(15, min(180, int(settings["endfade_duration"]))))
+            if "endfade_image_scale_enabled" in settings:
+                self.cb_ef_image_scale.setChecked(bool(settings["endfade_image_scale_enabled"]))
+            if "endfade_image_scale_offset" in settings:
+                self.slider_ef_img_offset.setValue(max(-120, min(120, int(settings["endfade_image_scale_offset"]))))
+            if "endfade_image_scale_duration" in settings:
+                self.slider_ef_img_dur.setValue(max(15, min(240, int(settings["endfade_image_scale_duration"]))))
             placement = settings.get("placement")
             if isinstance(placement, dict):
                 scale_pct = int(round(float(placement.get("scale", 1.0)) * 100))
@@ -1648,6 +1979,7 @@ class MainWindow(QMainWindow):
         if last_run.get("image") and os.path.isfile(last_run["image"]):
             self.image_path = last_run["image"]
             self.btn_image.setText(os.path.basename(self.image_path))
+            self._reload_overlay_image_pixmap()
         if last_run.get("music") and os.path.isfile(last_run["music"]):
             self.music_path = last_run["music"]
             self.btn_music.setText(os.path.basename(self.music_path))
@@ -1673,6 +2005,8 @@ class MainWindow(QMainWindow):
         self._image_adjust_dialog = ImageAdjustDialog(
             self, self.video_label.frame_size, placement, self.cb_warp.isChecked(),
         )
+        self._image_adjust_dialog.preview.show_placement_overlay = True
+        self._image_adjust_dialog.preview.set_overlay_image_pixmap(self._overlay_image_pixmap)
         if self._last_preview_pixmap is not None:
             self._image_adjust_dialog.preview.setPixmap(self._last_preview_pixmap)
         self._image_adjust_dialog.preview.placement_changed.connect(self.on_interactive_placement)
@@ -1755,8 +2089,18 @@ class MainWindow(QMainWindow):
         if path:
             self.image_path = path
             self.btn_image.setText(os.path.basename(path))
+            self._reload_overlay_image_pixmap()
             self.start_playback()
             self._save_session()
+
+    def _reload_overlay_image_pixmap(self):
+        if self.image_path and os.path.isfile(self.image_path):
+            pixmap = QPixmap(self.image_path)
+            self._overlay_image_pixmap = pixmap if not pixmap.isNull() else None
+        else:
+            self._overlay_image_pixmap = None
+        if self._image_adjust_dialog is not None:
+            self._image_adjust_dialog.preview.set_overlay_image_pixmap(self._overlay_image_pixmap)
 
     def select_music(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Music", MEDIA_DIR, "Audio Files (*.mp3 *.wav *.m4a *.flac *.aac)")
@@ -1770,24 +2114,27 @@ class MainWindow(QMainWindow):
         if self._is_webcam:
             self.timeline.hide()
             self.btn_play_pause.hide()
+            self.btn_overlay_window.hide()
             self.btn_record.show()
             self.btn_export.setEnabled(os.path.exists(TEMP_RECORDING))
         else:
             self.btn_record.hide()
             self.timeline.show()
             self.btn_play_pause.show()
+            self.btn_overlay_window.show()
             self.btn_export.setEnabled(True)
 
     def start_playback(self):
         if not self.video_path:
             return
-            
+
         self.btn_webcam.setEnabled(False)
         self.btn_video.setEnabled(False)
         self.btn_image.setEnabled(False)
         self.btn_music.setEnabled(False)
         QApplication.processEvents()
-        
+
+        self._reset_overlay_window_button()
         self.processor.set_media(self.video_path, self.image_path, self.music_path, is_webcam=self._is_webcam)
         
         self.btn_webcam.setEnabled(True)
@@ -1823,6 +2170,9 @@ class MainWindow(QMainWindow):
         elif not is_endfade:
             self.endfade_group.hide()
             
+        glitch_on = self.cb_glitch_fill.isChecked() and not self.cb_warp.isChecked()
+        self.slider_glitch_opacity.setVisible(glitch_on)
+            
         params = {
             "record_mic": self.cb_record_mic.isChecked(),
             "mic_device": self.cb_mic_device.currentData(),
@@ -1834,6 +2184,11 @@ class MainWindow(QMainWindow):
             "endfade_mode": is_endfade,
             "endfade_offset": self.slider_ef_offset.value(),
             "endfade_duration": self.slider_ef_dur.value(),
+            "endfade_image_scale_enabled": self.cb_ef_image_scale.isChecked() and not self.cb_warp.isChecked(),
+            "endfade_image_scale_offset": self.slider_ef_img_offset.value(),
+            "endfade_image_scale_duration": self.slider_ef_img_dur.value(),
+            "glitch_fill_enabled": glitch_on,
+            "glitch_fill_opacity": self.slider_glitch_opacity.value() / 100.0,
             "codec": codec_str,
             "placement": {
                 "x": self.slider_x.value(),
@@ -1890,10 +2245,43 @@ class MainWindow(QMainWindow):
         if self.processor._get_flag('_paused'):
             self.processor.set_paused(False)
             self.btn_play_pause.setText("Pause")
+            self.btn_overlay_window.setEnabled(False)
         else:
             self.processor.set_paused(True)
             self.btn_play_pause.setText("Play")
-            
+            self.btn_overlay_window.setEnabled(not self._is_webcam)
+
+    def _reset_overlay_window_button(self):
+        self._overlay_stage = "start"
+        self.btn_overlay_window.setText("Start Here")
+        self.btn_overlay_window.setStyleSheet("")
+        self.btn_overlay_window.setEnabled(False)
+
+    def on_overlay_window_clicked(self):
+        self.btn_overlay_window.setEnabled(False)
+        if self._overlay_stage == "start":
+            self.processor.set_overlay_start_here()
+        else:
+            self.processor.set_overlay_stop_here()
+
+    @pyqtSlot(int)
+    def on_overlay_start_set(self, frame_idx):
+        self._overlay_stage = "stop"
+        self.btn_overlay_window.setText("Stop Here")
+        self.btn_overlay_window.setStyleSheet("background-color: #ff6b6b; color: black; font-weight: bold;")
+
+    @pyqtSlot(int)
+    def on_overlay_stop_set(self, frame_idx):
+        self._overlay_stage = "start"
+        self.btn_overlay_window.setText("Start Here")
+        self.btn_overlay_window.setStyleSheet("")
+
+    @pyqtSlot(str)
+    def on_overlay_marker_failed(self, msg):
+        self.btn_overlay_window.setEnabled(self.processor._get_flag('_paused') and not self._is_webcam)
+        QMessageBox.warning(self, "Can't set marker", msg)
+
+
     def toggle_recording(self):
         if self.processor._get_flag('_recording'):
             self.processor.stop_recording()

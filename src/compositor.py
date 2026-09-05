@@ -55,6 +55,54 @@ def full_frame_placement(frame_w: int, frame_h: int):
     return {"x": frame_w / 2, "y": frame_h / 2, "scale": 1.0, "rotation_deg": 0.0}
 
 
+def placement_for_endfade_scale(
+    base_placement: dict,
+    image_bgra,
+    frame_w: int,
+    frame_h: int,
+    progress: float,
+) -> dict:
+    """Compute an interpolated placement where the image grows from its current
+    size/position toward letterbox-fitting the full frame, driven by `progress` [0, 1].
+
+    The image is never cropped or stretched — if proportions differ from the frame
+    you'll get letterboxing (transparent bars) rather than overflow.
+    """
+    if progress <= 0.0:
+        return base_placement
+
+    img_h, img_w = image_bgra.shape[:2]
+    if img_w < 1 or img_h < 1:
+        return base_placement
+
+    # Target: largest scale that fits the full image inside the frame
+    target_scale = min(frame_w / img_w, frame_h / img_h)
+
+    base_scale = max(base_placement.get("scale", 1.0), 0.001)
+    base_x = base_placement.get("x", frame_w / 2.0)
+    base_y = base_placement.get("y", frame_h / 2.0)
+
+    if progress >= 1.0:
+        return {
+            "x": frame_w / 2.0,
+            "y": frame_h / 2.0,
+            "scale": target_scale,
+            "rotation_deg": base_placement.get("rotation_deg", 0.0),
+        }
+
+    scale = base_scale + (target_scale - base_scale) * progress
+    x = base_x + (frame_w / 2.0 - base_x) * progress
+    y = base_y + (frame_h / 2.0 - base_y) * progress
+
+    return {
+        "x": x,
+        "y": y,
+        "scale": scale,
+        "rotation_deg": base_placement.get("rotation_deg", 0.0),
+    }
+
+
+
 def build_canvas(image_bgra, placement: dict, frame_w: int, frame_h: int):
     """Bakes the static image (scaled + rotated once, per placement) onto a
     frame-sized canvas. Returns (canvas_bgr uint8 HxWx3, canvas_alpha uint8 HxW).
@@ -135,6 +183,65 @@ def composite_frame(frame_bgr, quad_pts, canvas_bgr, canvas_alpha, feather: int 
     out_16 = frame_16 * (255 - alpha_3ch) + canvas_16 * alpha_3ch
     out = (out_16 // 255).astype(np.uint8)
     return out
+
+
+def glitch_fill_frame(raw_frame_bgr, composited_frame_bgr, quad_pts, canvas_alpha, bass_level: float, opacity: float, feather: int = 9):
+    """Fills the gap inside the quad (where the image canvas is transparent)
+    with a bass-reactive, color-inverted, blue-shifted version of the raw video.
+    """
+    if quad_pts is None or len(quad_pts) < 3 or opacity <= 0.0:
+        return composited_frame_bgr
+
+    h, w = raw_frame_bgr.shape[:2]
+    
+    # 1. Mask for the quad itself
+    quad_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(quad_mask, [quad_pts], 255)
+    
+    # 2. Subtract the image's alpha to get just the gap
+    # Where canvas_alpha is high, gap_mask becomes low.
+    if canvas_alpha.shape[:2] == (h, w):
+        gap_mask = cv2.subtract(quad_mask, canvas_alpha)
+    else:
+        gap_mask = quad_mask
+        
+    if feather > 0:
+        k = feather | 1
+        gap_mask = cv2.GaussianBlur(gap_mask, (k, k), 0)
+        
+    # Scale gap mask by master opacity
+    blend_weight = cv2.multiply(gap_mask, np.array([opacity * 255], dtype=np.float32), scale=1.0/255.0).astype(np.uint8)
+    
+    # If the gap is totally empty, fast return
+    if not np.any(blend_weight):
+        return composited_frame_bgr
+
+    # 3. Create glitch content from raw video
+    # Invert colors
+    glitch = 255 - raw_frame_bgr
+    
+    # Push toward blue (channel 0)
+    # Use int16 to avoid overflow during addition, then clip back to uint8
+    glitch_16 = glitch.astype(np.int16)
+    glitch_16[:, :, 0] = np.clip(glitch_16[:, :, 0] + 60, 0, 255)
+    
+    # Bass contrast adjustment (1.0x to 4.0x)
+    contrast_factor = 1.0 + float(bass_level) * 3.0
+    
+    # Apply contrast around mid-gray (128)
+    glitch_16 = np.clip(128 + (glitch_16 - 128) * contrast_factor, 0, 255)
+    glitch_bgr = glitch_16.astype(np.uint8)
+    
+    # 4. Composite the glitch layer into the already-composited frame
+    weight_3ch = cv2.merge([blend_weight, blend_weight, blend_weight])
+    
+    comp_16 = composited_frame_bgr.astype(np.uint16)
+    glitch_16 = glitch_bgr.astype(np.uint16)
+    
+    out_16 = comp_16 * (255 - weight_3ch) + glitch_16 * weight_3ch
+    out = (out_16 // 255).astype(np.uint8)
+    return out
+
 
 
 def warp_composite_frame(frame_bgr, quad_pts, image_bgra, feather: int = 9):

@@ -140,6 +140,13 @@ def session_compositing_settings(data):
         out["warp_mode"] = bool(data["warp_mode"])
     if "endfade_mode" in data:
         out["endfade_mode"] = bool(data["endfade_mode"])
+    if "glitch_fill_enabled" in data:
+        out["glitch_fill_enabled"] = bool(data["glitch_fill_enabled"])
+    if "glitch_fill_opacity" in data:
+        try:
+            out["glitch_fill_opacity"] = int(data["glitch_fill_opacity"])
+        except (TypeError, ValueError):
+            pass
     if "record_mic" in data:
         out["record_mic"] = bool(data["record_mic"])
     if "mic_device" in data and isinstance(data["mic_device"], str):
@@ -147,6 +154,8 @@ def session_compositing_settings(data):
     for key, caster in (
         ("endfade_offset", int),
         ("endfade_duration", int),
+        ("endfade_image_scale_offset", int),
+        ("endfade_image_scale_duration", int),
         ("feather", int),
         ("coast_limit", int),
     ):
@@ -155,6 +164,8 @@ def session_compositing_settings(data):
                 out[key] = caster(data[key])
             except (TypeError, ValueError):
                 pass
+    if "endfade_image_scale_enabled" in data:
+        out["endfade_image_scale_enabled"] = bool(data["endfade_image_scale_enabled"])
     codec = data.get("codec")
     if isinstance(codec, str) and codec.strip():
         out["codec"] = codec.strip().split(" ")[0]
